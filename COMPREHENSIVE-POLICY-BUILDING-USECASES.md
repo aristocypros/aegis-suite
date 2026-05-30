@@ -76,11 +76,11 @@ graph TD
     Policy --> Rule2["Rule 2: violations (Partial Set)"]
     
     Rule1 -->|Normal Kind| DefaultVal["default allow := false"]
-    Rule1 -->|OR (Alternative 1)| Branch1["Branch A (Retail limit check)"]
-    Rule1 -->|OR (Alternative 2)| Branch2["Branch B (VIP whitelist bypass)"]
+    Rule1 -->|"OR (Alternative 1)"| Branch1["Branch A (Retail limit check)"]
+    Rule1 -->|"OR (Alternative 2)"| Branch2["Branch B (VIP whitelist bypass)"]
     
-    Branch1 -->|AND (Clause 1)| Group1["Group 1 (mode: and)"]
-    Branch1 -->|AND (Clause 2)| Group2["Group 2 (mode: or)"]
+    Branch1 -->|"AND (Clause 1)"| Group1["Group 1 (mode: and)"]
+    Branch1 -->|"AND (Clause 2)"| Group2["Group 2 (mode: or)"]
     
     Group1 -->|Atom 1| Cond1["Condition: input.user.tier == 'retail'"]
     Group1 -->|Atom 2| Cond2["Condition: input.amount <= 10000"]
