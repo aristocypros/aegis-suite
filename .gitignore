@@ -1,0 +1,106 @@
+# ==========================================
+# OPA Policy Studio - Git Ignore Rules
+# ==========================================
+
+# ─── OS & System Files ────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ─── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+jspm_packages/
+web_modules/
+
+# ─── Environment & Secrets ───────────────────────────────────────────────────
+# Ignore environment variable files which contain local secrets / configurations
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+# But keep .env.example
+!.env.example
+
+# Local development certificates / keys / credentials
+*.pem
+*.key
+*.pub
+*.crt
+*.pfx
+*.p12
+
+# ─── Build & Bundler Outputs ──────────────────────────────────────────────────
+# Vite / Frontend build artifacts
+dist/
+dist-ssr/
+*.local
+
+# Production builds
+build/
+out/
+.next/
+.nuxt/
+.vuepress/dist
+.serverless/
+.fusebox/
+.dynamodb/
+
+# ─── Logs & Debugging ─────────────────────────────────────────────────────────
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ─── Testing & Reports ────────────────────────────────────────────────────────
+/test-results/
+/playwright-report/
+/blob-report/
+/.playwright-targets/
+.nyc_output/
+coverage/
+.jest/
+
+# ─── IDEs & Editors ──────────────────────────────────────────────────────────
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+
+# IntelliJ / WebStorm
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# Other editors
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
+
+# ─── CLI / Agent / MCP Tooling ────────────────────────────────────────────────
+.claude/
+.auto-claude/
+.auto-claude-security.json
+.auto-claude-status
+.playwright-mcp/
+
+# ─── Docker / Local DB Data ───────────────────────────────────────────────────
+# Ignore any local volume or database storage folders if created under the workspace root
+postgres-data/
+vault_data/
+vault_secrets/
+opa_trust/

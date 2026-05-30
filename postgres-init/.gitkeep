@@ -1,0 +1,5 @@
+# Mounted into the postgres container at /docker-entrypoint-initdb.d (read-only).
+# Drop *.sql / *.sh files here to run them on FIRST boot of a fresh database.
+# Currently empty: the backend builds the schema at startup via ensureSchema().
+# This file only exists so the (otherwise empty) mount-point directory is
+# tracked by git — remove it once real init scripts are added.

@@ -1,0 +1,19 @@
+{
+  "name": "opa-policy-studio-backend",
+  "version": "1.0.0",
+  "description": "Aegis Core — backend for Aegis Policy Fabric; compiles visual policies to Rego and manages OPA",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "import-key": "node ../scripts/import-key.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "express-async-errors": "^3.1.1",
+    "pg": "^8.13.0"
+  }
+}

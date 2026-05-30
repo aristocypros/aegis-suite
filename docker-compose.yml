@@ -1,0 +1,274 @@
+# Explicit Compose project name — pinned so it no longer derives from the
+# folder name. Renaming the directory will NOT re-prefix (and orphan) the
+# named volumes below, which hold Vault key material + Postgres state.
+name: aegis-suite
+
+services:
+  opa:
+    image: openpolicyagent/opa
+    container_name: aegis-opa
+    ports:
+      - "8181:8181"
+    volumes:
+      # Mount the studio's bundled system / application authz Rego policies.
+      # Loaded at OPA startup; cannot be overwritten via the studio UI.
+      - ./opa:/policies:ro
+      # Platform-trust JSON written by opa-trust-init BEFORE OPA starts.
+      # OPA loads this file at startup as data.platform_keys, which
+      # system_authz.rego consumes to verify the JWT every backend / PEP
+      # request carries. Mounted at a separate top-level path because
+      # Docker cannot create a subdirectory mountpoint underneath an RO
+      # bind mount (overlay refuses mkdirat on the RO layer).
+      - opa_trust:/trust:ro
+    command:
+      - "run"
+      - "--server"
+      - "--log-level=info"
+      - "--addr=0.0.0.0:8181"
+      - "--set=decision_logs.console=true"
+      # Token-based authentication: extracts Authorization: Bearer <token>
+      # into input.identity for every OPA REST request.
+      - "--authentication=token"
+      # Authorization gate: every request must pass data.system.authz.allow.
+      - "--authorization=basic"
+      # Load the bundled rego files + trust data at startup.
+      - "/policies/system_authz.rego"
+      - "/policies/studio_authz.rego"
+      - "/trust/platform_keys.json"
+    depends_on:
+      opa-trust-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/opa", "version"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - opa-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: aegis-postgres
+    environment:
+      POSTGRES_DB: opa_studio
+      POSTGRES_USER: opa_user
+      POSTGRES_PASSWORD: opa_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Init scripts run only on a fresh data directory; creates the `app_auth`
+      # database used by the demo app's better-auth tables.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U opa_user -d opa_studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - opa-net
+
+  vault:
+    image: hashicorp/vault:1.18
+    container_name: aegis-trustvault
+    cap_add:
+      - IPC_LOCK
+    entrypoint: ["vault"]
+    command: ["server", "-config=/vault/config/config.hcl"]
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+    volumes:
+      - vault_data:/vault/file
+      - vault_secrets:/vault/secrets
+      - ./vault/config.hcl:/vault/config/config.hcl:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - opa-net
+
+  vault-init:
+    image: hashicorp/vault:1.18
+    container_name: aegis-trustvault-init
+    depends_on:
+      vault:
+        condition: service_healthy
+    volumes:
+      - vault_secrets:/vault/secrets
+      - ./vault/bootstrap.sh:/vault/init/bootstrap.sh:ro
+    environment:
+      VAULT_ADDR: http://vault:8200
+    entrypoint: ["/bin/sh", "/vault/init/bootstrap.sh"]
+    networks:
+      - opa-net
+    restart: unless-stopped
+    healthcheck:
+      # All three tokens must be in place before downstream services can
+      # start: backend signs with backend_token, opa-trust-init reads with
+      # opa_trust_init_token, PEP signs with pep_token. pep_token is minted
+      # LAST in bootstrap.sh, so its presence is the gate.
+      test: ["CMD-SHELL", "test -f /vault/secrets/backend_token && test -f /vault/secrets/opa_trust_init_token && test -f /vault/secrets/pep_token"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  opa-trust-init:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aegis-trust-init
+    command: ["node", "scripts/opa-trust-init.js"]
+    depends_on:
+      vault-init:
+        condition: service_healthy
+    environment:
+      - KMS_PROVIDER=${KMS_PROVIDER:-vault}
+      - VAULT_ADDR=${VAULT_ADDR:-http://vault:8200}
+      - VAULT_TOKEN_FILE=/vault/secrets/opa_trust_init_token
+      # Match the env knobs the backend uses so rotations land on the same
+      # keyIds. Sensible defaults if unset.
+      - KMS_KEY_ID_OPA_AUTH=${KMS_KEY_ID_OPA_AUTH:-opa-auth-signing}
+      - KMS_KEY_ID_PEP_OPA_AUTH=${KMS_KEY_ID_PEP_OPA_AUTH:-pep-opa-auth-signing}
+      - OPA_TRUST_OUTPUT=/opa-trust/platform_keys.json
+    volumes:
+      - opa_trust:/opa-trust
+      - vault_secrets:/vault/secrets:ro
+    networks:
+      - opa-net
+    # One-shot — exit non-zero stops the chain so OPA never boots with a
+    # stale or missing trust file.
+    restart: "no"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aegis-core
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - OPA_URL=http://opa:8181
+      - DATABASE_URL=postgres://opa_user:opa_pass@postgres:5432/opa_studio
+      - NODE_ENV=production
+      - SEED_TEMPLATES=${SEED_TEMPLATES:-false}
+      - "BOOTSTRAP_ADMIN_USERNAME=${BOOTSTRAP_ADMIN_USERNAME:-admin}"
+      # KMS adapter. Default vault; override KMS_PROVIDER for cloud/HSM.
+      - KMS_PROVIDER=${KMS_PROVIDER:-vault}
+      - KMS_KEY_ID=${KMS_KEY_ID:-audit-signing}
+      # Per-purpose KMS keyIds for the platform-signing keys.
+      - KMS_KEY_ID_OPA_AUTH=${KMS_KEY_ID_OPA_AUTH:-opa-auth-signing}
+      - KMS_KEY_ID_SESSION=${KMS_KEY_ID_SESSION:-session-signing}
+      - KMS_KEY_ID_PEP_OPA_AUTH=${KMS_KEY_ID_PEP_OPA_AUTH:-pep-opa-auth-signing}
+      # Trust-file the opa-trust-init sidecar produced — read RO at boot to
+      # verify the file OPA loaded matches KMS+DB (tamper detection).
+      - OPA_TRUST_FILE=/opa-trust/platform_keys.json
+      # Vault-provider env (used when KMS_PROVIDER=vault).
+      - VAULT_ADDR=${VAULT_ADDR:-http://vault:8200}
+      - VAULT_TRANSIT_KEY=${VAULT_TRANSIT_KEY:-audit-signing}
+      - VAULT_TOKEN_FILE=/vault/secrets/backend_token
+    volumes:
+      - bootstrap_secret:/data
+      - vault_secrets:/vault/secrets:ro
+      - opa_trust:/opa-trust:ro
+    depends_on:
+      opa:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      vault-init:
+        condition: service_healthy
+    networks:
+      - opa-net
+
+  pep:
+    build:
+      context: ./pep
+      dockerfile: Dockerfile
+    container_name: aegis-sentry
+    ports:
+      - "3002:3002"
+    environment:
+      - PEP_PORT=3002
+      - OPA_URL=http://opa:8181
+      - PEP_REQUEST_TIMEOUT_MS=2000
+      # KMS signer wiring — PEP mints its own EdDSA JWTs for OPA.
+      - KMS_PROVIDER=${KMS_PROVIDER:-vault}
+      - KMS_KEY_ID_PEP_OPA_AUTH=${KMS_KEY_ID_PEP_OPA_AUTH:-pep-opa-auth-signing}
+      - VAULT_ADDR=${VAULT_ADDR:-http://vault:8200}
+      - VAULT_TOKEN_FILE=/vault/secrets/pep_token
+      # PEP-01: per-caller auth (multi-mode). Each pep_callers row declares
+      # its own auth_mode (hmac | mtls | jwt); the PEP dispatches per
+      # request. PEP_DEV_ALLOW_ANON keeps the laptop path frictionless by
+      # admitting unauthenticated requests as "anonymous" — refused under
+      # NODE_ENV=production.
+      - NODE_ENV=${PEP_NODE_ENV:-development}
+      - PEP_DEV_ALLOW_ANON=${PEP_DEV_ALLOW_ANON:-true}
+      # mtls support requires all three TLS files. When set the PEP listens
+      # HTTPS with requestCert:true so hmac/jwt callers can still connect
+      # cert-less. When unset the PEP listens HTTP and mtls-mode rows are
+      # unusable (they'd need a cert nobody can present).
+      - PEP_TLS_CERT=${PEP_TLS_CERT:-}
+      - PEP_TLS_KEY=${PEP_TLS_KEY:-}
+      - PEP_TLS_CA=${PEP_TLS_CA:-}
+      - PEP_ALLOWED_CALLERS=${PEP_ALLOWED_CALLERS:-}
+      # JWT verifier wires when iss + aud are both set. Per-caller jwt rows
+      # are unusable without them; the dispatcher returns mode_not_configured.
+      - PEP_JWKS_URL=${PEP_JWKS_URL:-http://backend:3001/.well-known/jwks.json}
+      - PEP_JWT_ISSUER=${PEP_JWT_ISSUER:-}
+      - PEP_JWT_AUDIENCE=${PEP_JWT_AUDIENCE:-}
+      - PEP_HMAC_WINDOW_MS=${PEP_HMAC_WINDOW_MS:-30000}
+      - PEP_NONCE_CACHE_MAX=${PEP_NONCE_CACHE_MAX:-50000}
+      - PEP_CALLER_TTL_MS=${PEP_CALLER_TTL_MS:-30000}
+    volumes:
+      - vault_secrets:/vault/secrets:ro
+    depends_on:
+      opa:
+        condition: service_healthy
+      vault-init:
+        condition: service_healthy
+    networks:
+      - opa-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aegis-studio
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - opa-net
+
+networks:
+  opa-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  bootstrap_secret:
+    driver: local
+  app-audit-data:
+    driver: local
+  # Vault's file storage backend — holds the encrypted audit signing key.
+  # MUST persist for the deployment's lifetime; losing it freezes the chain.
+  vault_data:
+    driver: local
+  # Shared between vault-init (writer) and consumers (read-only). Holds the
+  # unseal key + root token (init.json) and the per-service signer tokens.
+  vault_secrets:
+    driver: local
+  # Shared between opa-trust-init (writer) and OPA + backend (read-only).
+  # Holds platform_keys.json, the public-key bundle OPA loads at boot to
+  # verify incoming JWTs.
+  opa_trust:
+    driver: local

@@ -1,0 +1,19 @@
+{
+  "name": "opa-policy-studio-pep",
+  "version": "1.0.0",
+  "description": "Aegis Sentry — generic Policy Enforcement Point in front of the Aegis Policy Fabric PDP.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "jose": "^5.9.6",
+    "lru-cache": "^11.0.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

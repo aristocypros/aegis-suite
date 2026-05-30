@@ -1,0 +1,512 @@
+openapi: 3.0.3
+info:
+  title: Aegis Sentry API
+  version: 1.0.0
+  description: |
+    Welcome to the **Aegis Sentry (the Policy Enforcement Point)** API reference for client developers.
+
+    Aegis Sentry is a high-performance, generic, application-agnostic proxy that sits in front of **OPA (Open Policy Agent)** and the **Aegis Policy Fabric**. It secures policy evaluation, enforces caller authentication, verifies access control lists (ACLs), logs policy decisions, and ensures calling services have no direct access to underlying OPA instances or the policy database.
+
+    ---
+
+    ## 1. Developer Setup & Provisioning Flow
+
+    You cannot call Aegis Sentry until you have been provisioned in the Aegis Studio web UI by an **Aegis Studio Admin**. Follow this flow to get started:
+
+    1. **Choose Authentication Mode**: Select either `hmac`, `jwt`, or `mtls` (see §2).
+    2. **Pick a Caller ID**: A unique, stable identifier matching `^[A-Za-z0-9_.-]{1,64}$` (e.g., `checkout-svc`, `billing-pipeline`).
+    3. **Enumerate Scope**: Provide the admin with a list of policy package paths you need access to (e.g., `payments/allow`, `risk/score`) or request access via a **scope tag** for dynamic access.
+    4. **Request Provisioning**: Send your Caller ID, chosen Auth Mode, and Scope requests to the admin.
+    5. **Secure Delivery**: Receive configuration variables and secret materials from the admin through a secure channel (e.g., a 1Password vault).
+
+    ---
+
+    ## 2. Authentication Modes & Integration
+
+    Aegis Sentry supports three cryptographic authentication mechanisms. Your chosen mode is **immutable** once provisioned.
+
+    ### A. HMAC Mode (`hmac`)
+    Best for external integrations, scripting, or environments without a PKI or identity provider.
+    * **Secret**: The admin shares a unique, base64url-encoded shared secret.
+    * **Header**: Every request must carry the `X-Studio-Sig` header:
+      ```http
+      X-Studio-Sig: caller=<caller_id>,ts=<unix-seconds>,nonce=<random_string>,sig=<signature>
+      ```
+    * **Signature Rule**:
+      ```
+      sig = base64url( HMAC-SHA256(secret, ts + "." + nonce + "." + path + "." + body) )
+      ```
+      * `path` is the leading-slash path without query strings (e.g. `/authorize`).
+      * `body` is the **exact raw request body bytes** that you POST. Do not re-serialize or pretty-print the JSON between signing and sending.
+      * `nonce` must be a fresh, random, unique value per request (replay protection).
+      * `ts` must be within a **30-second window** of the Aegis Sentry system clock.
+
+    #### Node.js Code Snippet
+    ```javascript
+    import { createHmac, randomBytes } from "node:crypto";
+
+    const SECRET = process.env.PEP_HMAC_SECRET;
+    const CALLER = "checkout-svc";
+    const PEP    = process.env.PEP_URL; // e.g. https://pep.studio.example.com:3002
+
+    async function pepCall(path, payload) {
+      const body  = JSON.stringify(payload);
+      const ts    = Math.floor(Date.now() / 1000);
+      const nonce = randomBytes(12).toString("base64url");
+      const sig   = createHmac("sha256", SECRET)
+        .update(`${ts}.${nonce}.${path}.`)
+        .update(Buffer.from(body))
+        .digest("base64url");
+
+      const res = await fetch(`${PEP}${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Studio-Sig": `caller=${CALLER},ts=${ts},nonce=${nonce},sig=${sig}`,
+        },
+        body,
+      });
+      if (!res.ok) throw new Error(`PEP ${res.status}: ${await res.text()}`);
+      return res.json();
+    }
+    ```
+
+    #### Python Code Snippet
+    ```python
+    import hmac, hashlib, base64, json, os, secrets, time, requests
+
+    SECRET = os.environ["PEP_HMAC_SECRET"].encode()
+    CALLER = "checkout-svc"
+    PEP    = os.environ["PEP_URL"]
+
+    def pep_call(path, payload):
+        body  = json.dumps(payload, separators=(",", ":")).encode()
+        ts    = str(int(time.time()))
+        nonce = base64.urlsafe_b64encode(secrets.token_bytes(12)).rstrip(b"=").decode()
+        msg   = f"{ts}.{nonce}.{path}.".encode() + body
+        sig   = base64.urlsafe_b64encode(hmac.new(SECRET, msg, hashlib.sha256).digest()).rstrip(b"=").decode()
+        r = requests.post(f"{PEP}{path}", data=body, headers={
+            "content-type": "application/json",
+            "X-Studio-Sig": f"caller={CALLER},ts={ts},nonce={nonce},sig={sig}",
+        })
+        r.raise_for_status()
+        return r.json()
+    ```
+
+    ### B. JWT Mode (`jwt`)
+    Best for internal microservices already leveraging an Identity Provider (IdP) like Auth0, Okta, or a platform SSO.
+    * **Header**: Include the standard Authorization header:
+      ```http
+      Authorization: Bearer <jwt_token>
+      ```
+    * **Verification**: Aegis Sentry validates the JWT signature offline against your IdP's public JWKS endpoint. It enforces `iss`, `aud`, and `exp`.
+    * **Caller Mapping**: Aegis Sentry extracts the `sub` claim. By default, `sub` must match your `callerId`, or the admin must pin a specific `jwtSubject` on your caller record.
+
+    ### C. mTLS Mode (`mtls`)
+    Best for service meshes (e.g., Istio, Linkerd) or highly secure private infrastructure with client-side certificates.
+    * **Trust Exchange**: The admin provides the Aegis Sentry Root/CA bundle (`ca.crt`). You generate a private key and a CSR (Certificate Signing Request) with a agreed Common Name (CN), e.g., `/CN=checkout.svc.acme.com`.
+    * **Signing**: The admin signs your CSR and returns `client.crt`.
+    * **Handshake**: Your client initiates HTTPS connections presenting the `client.crt` and `client.key`. Aegis Sentry extracts the CN and matches it against your provisioned `allowedCn`.
+    * *Note: Since mTLS is transport-level security, no HTTP authorization headers are required in this mode.*
+
+    ---
+
+    ## 3. Policy Decisions vs. Errors
+
+    Understanding the difference between a **denial** and a **system error** is critical:
+    * **Policy Denial (HTTP 200 OK)**:
+      Your credentials were correct, the request was authenticated, and the policy evaluated. The policy decided that the request should be blocked. The response is a standard `200` with `"allow": false`.
+    * **System Error (HTTP 4xx / 5xx)**:
+      The request failed authentication, was malformed, or Aegis Sentry encountered an internal timeout/outage. Do not retry `4xx` responses without resolving credential or formatting issues.
+
+servers:
+  - url: https://pep.studio.example.com:3002
+    description: Production Aegis Sentry Proxy (mTLS enforced or TLS HTTPS)
+  - url: http://localhost:3002
+    description: Local Sandbox Development server (HTTP)
+
+paths:
+  /authorize:
+    post:
+      summary: Evaluate Policy Decision
+      description: |
+        Evaluates a specified policy using the provided input context.
+        This endpoint verifies the caller's credentials, asserts that the policy is within the caller's authorized scope (ACL), and forwards the input context to OPA.
+      operationId: authorizePolicy
+      security:
+        - HMACAuth: []
+        - BearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthorizeRequest'
+      responses:
+        '200':
+          description: Successful policy evaluation. This includes both allows and denials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorizeResponse'
+        '400':
+          description: Malformed request. Returned if the request body is invalid, the policy path is empty/invalid, or input is not a plain object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PepErrorResponse'
+        '401':
+          description: Authentication failure. Returned if credentials are missing, mismatched, invalid, or expired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorResponse'
+        '403':
+          description: Forbidden. Returned if the caller is authenticated but does not have ACL permission to call this policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PepErrorResponse'
+        '409':
+          description: Conflict (HMAC only). Returned as a `nonce_replay` error if the provided nonce has already been used within the window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorResponse'
+        '502':
+          description: Bad Gateway. Returned if the access control database query fails (`acl_lookup_failed`) or if OPA PDP is unreachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PepErrorResponse'
+        '504':
+          description: Gateway Timeout. Returned if OPA PDP fails to respond within the configured request timeout.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PepErrorResponse'
+
+  /discover:
+    post:
+      summary: Discover Applicable Policies
+      description: |
+        Analyzes the provided input context and returns a list of policies whose required inputs match.
+        This is highly useful for client self-discovery or dynamic frontend engines.
+        
+        Three modes are supported via the `mode` query parameter:
+        * `strict` (Default): Returns only policies whose required input paths are completely satisfied.
+        * `score`: Returns all policies with at least partial match, ranked by matched/required ratio.
+        * `catalog`: Ignores the input entirely and lists every policy in the caller's ACL scope. Pass `{}` as the body.
+      operationId: discoverPolicies
+      security:
+        - HMACAuth: []
+        - BearerAuth: []
+        - {}
+      parameters:
+        - name: mode
+          in: query
+          description: Evaluation mode for discovery matching.
+          required: false
+          schema:
+            type: string
+            enum: [strict, score, catalog]
+            default: strict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiscoverRequest'
+      responses:
+        '200':
+          description: Successful discovery results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscoverResponse'
+        '400':
+          description: Malformed request. Returned if `input` is not a plain JSON object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PepErrorResponse'
+        '401':
+          description: Authentication failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorResponse'
+        '502':
+          description: Bad Gateway. Returned if OPA or the policy index is unreachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PepErrorResponse'
+
+  /healthz:
+    get:
+      summary: Liveness and Readiness Probe
+      description: |
+        Checks Aegis Sentry's health state.
+        This endpoint is **public** and does not require authentication, so that orchestrators (e.g. Kubernetes, Docker) can probe container liveness.
+      operationId: checkHealth
+      responses:
+        '200':
+          description: Aegis Sentry is healthy and running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  securitySchemes:
+    HMACAuth:
+      type: apiKey
+      in: header
+      name: X-Studio-Sig
+      description: |
+        HMAC signature scheme.
+        Format: `caller=<callerId>,ts=<timestamp>,nonce=<random>,sig=<signature>`
+        Refer to the root description for detailed signing rules.
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT Access Token Bearer authentication.
+
+  schemas:
+    AuthorizeRequest:
+      type: object
+      required:
+        - policy
+      properties:
+        policy:
+          type: string
+          description: Dotted or slashed path of the OPA policy package (e.g., `payments/allow` or `payments.allow`).
+          example: payments/allow
+        input:
+          type: object
+          description: Verbatim JSON object context passed directly as `input` into OPA.
+          default: {}
+          example:
+            user:
+              id: u1
+              tier: pro
+            amount: 50000
+            action: transfer
+
+    AuthorizeResponse:
+      type: object
+      required:
+        - allow
+        - result
+        - elapsedMs
+      properties:
+        allow:
+          type: boolean
+          description: The canonical normalized evaluation outcome. `true` means permitted; `false` means denied.
+          example: true
+        reason:
+          type: string
+          description: Optional user-facing explanation returned by the policy logic.
+          example: tier_eligible
+        result:
+          type: object
+          nullable: true
+          description: The raw evaluation JSON structure returned directly by the OPA compiler.
+          example:
+            allow: true
+            reason: tier_eligible
+        elapsedMs:
+          type: integer
+          description: System latency in milliseconds.
+          example: 7
+
+    DiscoverRequest:
+      type: object
+      properties:
+        input:
+          type: object
+          description: Context object used to match input paths (e.g., `user.tier`). Pass `{}` in `catalog` mode.
+          default: {}
+          example:
+            user:
+              tier: pro
+            amount: 50000
+
+    DiscoverResponse:
+      type: object
+      required:
+        - mode
+        - candidates
+        - indexedPolicies
+        - elapsedMs
+      properties:
+        mode:
+          type: string
+          enum: [strict, score, catalog]
+          example: strict
+        candidates:
+          type: array
+          description: List of policies matching the query criteria.
+          items:
+            $ref: '#/components/schemas/DiscoveryCandidate'
+        indexedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp of when the policy index cache was last generated in Aegis Studio.
+          example: "2026-05-10T11:42:08.123Z"
+        indexedPolicies:
+          type: integer
+          description: Total count of policies currently loaded into the caller's allowed ACL scope.
+          example: 4
+        elapsedMs:
+          type: integer
+          description: System execution time in milliseconds.
+          example: 2
+
+    DiscoveryCandidate:
+      type: object
+      required:
+        - id
+        - name
+        - package
+        - requiredPaths
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: System generated policy UUID.
+          example: "3f7a1c2e-84b0-4e1f-9d23-abc123456789"
+        name:
+          type: string
+          description: Human-readable name of the policy.
+          example: "Tiered Transaction Limits"
+        package:
+          type: string
+          description: Dotted package path to call.
+          example: "payments.allow"
+        description:
+          type: string
+          description: Policy documentation summary.
+          example: "Per-tier transaction limits with approval bypass"
+        requiredPaths:
+          type: array
+          description: list of dot-notated paths the policy reads from `input` (extracted dynamically).
+          items:
+            type: string
+          example: ["user.tier", "amount"]
+        matchedPaths:
+          type: array
+          description: (Score mode only) Subset of required paths that exist in the request body.
+          items:
+            type: string
+          example: ["user.tier"]
+        missingPaths:
+          type: array
+          description: (Score mode only) Subset of required paths missing from the request body.
+          items:
+            type: string
+          example: ["amount"]
+        score:
+          type: number
+          format: float
+          description: (Score mode only) Ratio of matchedPaths to requiredPaths (0.0 to 1.0).
+          example: 0.5
+
+    PepErrorResponse:
+      type: object
+      required:
+        - allow
+        - error
+      properties:
+        allow:
+          type: boolean
+          description: Always `false` on system errors.
+          example: false
+        error:
+          type: string
+          description: Error type identifier.
+          enum:
+            - policy_required
+            - input_not_object
+            - invalid_policy_path
+            - policy_not_in_scope
+            - acl_lookup_failed
+            - pdp_unreachable
+            - pdp_timeout
+          example: policy_not_in_scope
+        policy:
+          type: string
+          description: Echoes the requested policy (returned in `policy_not_in_scope` errors).
+          example: payments/allow
+
+    AuthErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Precise authentication error identifier.
+          enum:
+            - no_credentials
+            - ambiguous_credentials
+            - auth_mode_mismatch
+            - mode_not_configured
+            - unknown_caller
+            - caller_not_allowed
+            - signature_mismatch
+            - timestamp_out_of_window
+            - nonce_replay
+            - missing_or_malformed_signature
+            - invalid_timestamp
+            - invalid_signature_encoding
+            - caller_misconfigured
+            - missing_bearer_token
+            - jwt_missing_sub
+            - invalid_jwt
+            - client_cert_required
+            - untrusted_client_cert
+            - client_cert_missing_cn
+          example: signature_mismatch
+        presented:
+          type: array
+          description: List of credential types detected (returned in `ambiguous_credentials` errors).
+          items:
+            type: string
+          example: ["hmac", "jwt"]
+        reason:
+          type: string
+          description: Underlying technical failure detail (e.g. specific openSSL rejection or JOSE verification code).
+          example: ERR_JWT_EXPIRED
+        skewMs:
+          type: integer
+          description: Clock discrepancy in milliseconds (returned on `timestamp_out_of_window` errors).
+          example: 45200
+        windowMs:
+          type: integer
+          description: Maximum allowed skew threshold in milliseconds (returned on `timestamp_out_of_window` errors).
+          example: 30000
+        mode:
+          type: string
+          description: Echoes the requested auth mode (returned on `mode_not_configured` errors).
+          example: jwt
+
+    HealthResponse:
+      type: object
+      required:
+        - ok
+        - opaReachable
+      properties:
+        ok:
+          type: boolean
+          description: Liveness state of the Aegis Sentry service proxy. Always `true`.
+          example: true
+        opaReachable:
+          type: boolean
+          description: Readiness check indicating whether OPA PDP is actively communicating.
+          example: true
