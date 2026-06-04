@@ -21,6 +21,7 @@ import * as auth from "./services/auth.js";
 import * as bootstrap from "./services/bootstrap.js";
 import * as audit from "./services/audit.js";
 import * as platformKeys from "./services/platformKeys.js";
+import * as opaTracker from "./services/opaTracker.js";
 import { startJwksFetcher } from "./services/jwksFetcher.js";
 import { createTrustKeysRouter } from "./routes/trustKeys.js";
 import { createPepCallersRouter } from "./routes/pepCallers.js";
@@ -29,6 +30,7 @@ import { createPolicyCallersRouter } from "./routes/policyCallers.js";
 import { createPlatformKeysRouter } from "./routes/platformKeys.js";
 import { createOrgsRouter } from "./routes/orgs.js";
 import { createRolesRouter } from "./routes/roles.js";
+import { createOpaFleetRouter } from "./routes/opaFleet.js";
 import { authenticate } from "./middleware/authenticate.js";
 import { authorize } from "./middleware/authorize.js";
 // getPolicyVersions and getPolicyVersion are accessed via store.*
@@ -137,13 +139,20 @@ app.get("/bundle/aegis.tar.gz", async (req, res) => {
     console.error(`[opa-bundle] build failed: ${e.message}`);
     return res.status(500).json({ error: "bundle build failed" });
   }
+
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const userAgent = req.get("user-agent") || "unknown";
+  const ifNoneMatch = req.get("if-none-match") || "";
+
   const etag = `"${bundle.revision}"`;
   res.set("ETag", etag);
   res.set("Cache-Control", "no-store");
   // OPA sends If-None-Match once it holds a revision; 304 skips re-download.
   if ((req.get("if-none-match") || "") === etag) {
+    opaTracker.recordPoll(ip, userAgent, ifNoneMatch, bundle.revision, 304);
     return res.status(304).end();
   }
+  opaTracker.recordPoll(ip, userAgent, ifNoneMatch, bundle.revision, 200);
   res.set("Content-Type", "application/gzip");
   res.status(200).send(bundle.tarGz);
 });
@@ -1018,6 +1027,7 @@ app.use("/api/platform-keys", createPlatformKeysRouter({ publish: invalidateBund
 
 app.use("/api/orgs",  createOrgsRouter());
 app.use("/api/roles", createRolesRouter());
+app.use("/api/opa-fleet", createOpaFleetRouter());
 
 // ─── Evaluate (sandbox) ────────────────────────────────────────────────────
 app.post("/api/evaluate/:id", async (req, res) => {

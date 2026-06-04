@@ -33,6 +33,7 @@ import * as platformKeys from "./platformKeys.js";
 import { buildPolicyIndex } from "./policyIndex.js";
 import { buildCallerAccess } from "./callerAccess.js";
 import { publishValueFromRow } from "./trustKeys.js";
+import * as opaTracker from "./opaTracker.js";
 
 // Fixed data/authz roots the bundle always owns. Granular (not bare `studio`)
 // so the reserved-prefix guard in regoCompiler.js is the only thing user
@@ -182,7 +183,7 @@ async function collect() {
   // Active (non-locked) compiled policy modules, sorted for a stable revision.
   const modules = policies
     .filter((p) => !p.locked && p.rego && p.package)
-    .map((p) => ({ id: p.id, package: p.package, rego: p.rego }))
+    .map((p) => ({ id: p.id, package: p.package, rego: p.rego, name: p.name, version: p.version }))
     .sort((a, b) => String(a.id).localeCompare(String(b.id)));
 
   return { policyIndex, keys, callers, callerAccess, platform, modules };
@@ -237,6 +238,16 @@ export async function buildBundle() {
 
   const tarGz = gzipSync(buildTar(entries), { level: 9 });
   _cache = { tarGz, revision, builtAt: Date.now() };
+
+  // Record the policies in this revision
+  const revisionPolicies = data.modules.map((m) => ({
+    id: m.id,
+    name: m.name || "Unknown",
+    package: m.package,
+    version: m.version || 1,
+  }));
+  opaTracker.recordRevisionPolicies(revision, revisionPolicies);
+
   console.log(
     `[opa-bundle] built revision ${revision.slice(0, 12)} ` +
       `(${data.modules.length} policies, ${Object.keys(data.callers).length} callers, ` +

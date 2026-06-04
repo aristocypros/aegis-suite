@@ -18,6 +18,7 @@ export default function TopBar({
   onShowPlatformKeys,
   onShowOrgs,
   onShowRoles,
+  onShowOpaFleet,
   onChangePassword,
   currentTheme,
   onThemeChange,
@@ -405,6 +406,15 @@ export default function TopBar({
                     onClick={() => { setMenuOpen(false); onShowPlatformKeys?.(); }}
                   >
                     Platform keys
+                  </button>
+                )}
+                {user.isRoot && (
+                  <button
+                    type="button"
+                    className="user-menu-item"
+                    onClick={() => { setMenuOpen(false); onShowOpaFleet?.(); }}
+                  >
+                    OPA Fleet Status
                   </button>
                 )}
                 <div className="user-menu-divider" />

@@ -17,6 +17,7 @@ import PlatformKeys from "./components/PlatformKeys.jsx";
 import AuditLog from "./components/AuditLog.jsx";
 import Orgs from "./components/Orgs.jsx";
 import Roles from "./components/Roles.jsx";
+import OpaFleet from "./components/OpaFleet.jsx";
 import { THEMES } from "./lib/themes.js";
 
 
@@ -74,6 +75,7 @@ export default function App() {
   const [showAuditLog, setShowAuditLog] = useState(false);
   const [showOrgs, setShowOrgs] = useState(false);
   const [showRoles, setShowRoles] = useState(false);
+  const [showOpaFleet, setShowOpaFleet] = useState(false);
 
   // ── Studio state ───────────────────────────────────────────────────────
   const [policies, setPolicies] = useState([]);
@@ -136,6 +138,7 @@ export default function App() {
         setShowAuditLog(false);
         setShowOrgs(false);
         setShowRoles(false);
+        setShowOpaFleet(false);
         setActive(null);
         setActiveId(null);
         setPolicies([]);
@@ -384,6 +387,7 @@ export default function App() {
         onShowAudit={() => setShowAuditLog(true)}
         onShowOrgs={() => setShowOrgs(true)}
         onShowRoles={() => setShowRoles(true)}
+        onShowOpaFleet={() => setShowOpaFleet(true)}
         onChangePassword={() => setShowChangePassword(true)}
         currentTheme={themeId}
         onThemeChange={setThemeId}
@@ -463,6 +467,10 @@ export default function App() {
 
       {showRoles && !forcedChange && (
         <Roles currentUser={user} onClose={() => setShowRoles(false)} />
+      )}
+
+      {showOpaFleet && !forcedChange && (
+        <OpaFleet onClose={() => setShowOpaFleet(false)} />
       )}
 
       {(forcedChange || showChangePassword) && (

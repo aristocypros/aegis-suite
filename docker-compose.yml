@@ -6,9 +6,10 @@ name: aegis-suite
 services:
   opa:
     image: openpolicyagent/opa
-    container_name: aegis-opa
     ports:
-      - "8181:8181"
+      - "8181"
+    deploy:
+      replicas: 3
     volumes:
       # BUNDLE-PULL mode: OPA boots with ONLY this config and pulls everything
       # (system/studio authz Rego + policies + data + platform_keys) from the

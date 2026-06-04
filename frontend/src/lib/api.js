@@ -200,6 +200,7 @@ export const api = {
     req(`/platform-keys/${encodeURIComponent(fp)}/revoke`, { method: "POST" }),
   getPlatformKeysOpaState: () => req("/platform-keys/opa-state"),
   getPlatformKeysTrustStatus: () => req("/platform-keys/trust-status"),
+  getOpaFleet: () => req("/opa-fleet"),
 
   // ── Audit (admin only) ──────────────────────────────────────────────────
   listAudit: ({ limit, beforeSeq, action, resourceId } = {}) => {
