@@ -39,11 +39,10 @@ flowchart TB
 | `frontend`   | 3000 → nginx:80 | React/Vite SPA. The Visual Builder, Sandbox, audit viewer, and admin pages. Proxies `/api` → backend. |
 | `backend`    | 3001            | Aegis Core Express API. Compiles specs → Rego, manages users / policies / trust keys / Aegis Sentry callers, signs the audit chain via Aegis TrustVault. |
 | `pep`        | 3002            | Aegis Sentry. Stateless `/authorize` + `/discover`. Authenticates callers (mTLS / HMAC / JWT) and forwards `input` to OPA. |
-| `opa`        | 8181            | Policy engine. Gated by `system_authz` (EdDSA JWT per request) and consulted via `studio_authz` on mutating routes. |
+| `opa`        | 8181            | Policy engine. Boots with only `opa/config.yaml` and **pulls** a bundle (policies + data + authz Rego + `platform_keys`) from the backend's `/bundle`. Gated by `system_authz` (EdDSA JWT per request) and consulted via `studio_authz` on mutating routes. Stateless — run as many replicas as you like; they all converge on the same bundle. |
 | `postgres`   | 5433 → 5432     | Users, orgs, roles, policies, versions, audit log, trust keys, Aegis Sentry callers. |
 | `vault`      | (internal)      | Default Aegis TrustVault provider. Holds the Ed25519 audit-signing key in Transit; the private key never leaves it. |
-| `vault-init` | (one-shot)      | Initialises Vault on first boot and mints the scoped signer tokens (backend, opa-trust-init, pep). |
-| `opa-trust-init` | (one-shot)  | Reads the OPA-auth + PEP-OPA-auth pubkeys from Vault and writes `platform_keys.json` to the shared trust volume; runs before `opa`. |
+| `vault-init` | (one-shot)      | Initialises Vault on first boot, mints the scoped signer tokens (`backend_token`, `pep_token`), and generates the `opa_bundle_token` shared secret OPA uses to pull the bundle. |
 
 The compiler is the security boundary: every condition in a JSON spec is validated against per-op whitelists, then rendered into Rego v1. User-authored specs cannot produce arbitrary Rego. The audit chain is hash-linked + Ed25519-signed; if the chain breaks, `studio.authz` freezes all mutations.
 
@@ -57,32 +56,28 @@ sequenceDiagram
     participant VaultInit as vault-init (one-shot)
     participant Vault as vault (Sealed)
     participant DB as postgres (Healthy)
-    participant TrustInit as opa-trust-init (one-shot)
-    participant OPA as opa (Engine)
     participant Backend as backend (Core)
+    participant OPA as opa (Engine)
     participant PEP as pep (Enforcer)
 
     Note over Vault: Starts sealed on compose up
     VaultInit->>Vault: Initialises (1-of-1 key) & Unseals
     VaultInit->>Vault: Enables Transit Engine & Creates Policies
-    VaultInit->>Vault: Mints scoped tokens (backend_token, pep_token, trust_init_token)
-    
+    VaultInit->>VaultInit: Mints backend_token, pep_token + generates opa_bundle_token
+
     Note over DB: Postgres starts in parallel
-    
-    TrustInit->>Vault: Reads trust_init_token, calls Transit ensureKey
-    TrustInit->>Vault: Fetches pubkeys for 'opa-auth-signing' & 'pep-opa-auth-signing'
-    TrustInit->>TrustInit: Writes platform_keys.json locally
-    
-    Note over OPA: OPA starts with mounted platform_keys.json
-    
+
     Backend->>DB: Runs ensureSchema (Tables & Triggers)
     Backend->>Vault: loadOrInitSigningKey ('audit-signing') & caches pubkey
     Backend->>DB: ensurePlatformDefaults & bootstrapInitialAdmin
-    Backend->>Vault: loadOrInitPlatformKeys (opa-auth-signing, session-signing, pep-opa-auth-signing)
+    Backend->>Vault: loadOrInitPlatformKeys (opa-auth-signing, session-signing, pep-opa-auth-signing — backend creates the pep key now)
     Backend->>DB: Registers key fingerprints in DB
-    Backend->>Backend: Validates Vault ↔ DB ↔ Trust File (integrity verification)
-    Backend->>OPA: Pushes compiled policies, policy_index, callers & JWKS settings
-    
+    Backend->>Backend: Warms the OPA bundle (authz Rego + policies + data + platform_keys) → /healthz green
+
+    Note over OPA: OPA starts only after backend is healthy (depends_on)
+    OPA->>Backend: GET /bundle/aegis.tar.gz (bearer = opa_bundle_token), polls every 10-20s
+    OPA->>OPA: Activates bundle (system_authz + data.platform_keys now live)
+
     PEP->>Vault: Reads pep_token, creates Transit JWT signer
     PEP->>OPA: Mints EdDSA JWT for queries to OPA
 ```
@@ -93,26 +88,24 @@ sequenceDiagram
 1. **`vault`** starts sealed.
 2. **`vault-init`** (sidecar) runs against `vault`:
    - initialises Vault (1-of-1 unseal share → `init.json`), unseals, enables the Transit secrets engine.
-   - writes three least-privilege policies and mints one scoped token per consumer:
-     - `backend_token` → sign with `audit-signing` + `opa-auth-signing*` + `session-signing*`, read `pep-opa-auth-signing*` pubkey.
-     - `opa_trust_init_token` → read+create only, no signing.
+   - writes least-privilege policies and mints one scoped token per consumer:
+     - `backend_token` → sign with `audit-signing` + `opa-auth-signing*` + `session-signing*`; **read+update** (create/rotate, never sign) on `pep-opa-auth-signing*`.
      - `pep_token` → sign-only on `pep-opa-auth-signing*`.
+   - generates `opa_bundle_token` (mode 0644) — the bearer OPA presents to the backend's `/bundle` endpoint.
 3. **`postgres`** starts in parallel and becomes healthy.
-4. **`opa-trust-init`** (one-shot) reads `opa_trust_init_token`, calls Vault Transit to `ensureKey` for `opa-auth-signing` and `pep-opa-auth-signing` (Ed25519, `exportable=false` — private bytes never leave Vault), fetches their pubkeys, writes `/opa-trust/platform_keys.json` (public PEMs only), exits 0.
-5. **`opa`** starts and loads:
-   - `system_authz.rego` — gates every REST request via EdDSA JWT verification against `data.platform_keys`.
-   - `studio_authz.rego` — application-layer authz consulted by Aegis Core on every mutating route.
-   - `platform_keys.json` — mounted at `data.platform_keys`, the trust anchor for incoming JWTs.
+4. *(removed)* — there is no `opa-trust-init` sidecar anymore. The backend creates the `opa-auth-signing` and `pep-opa-auth-signing` keys itself (`loadOrInitPlatformKeys`) and folds their pubkeys into the bundle as `data.platform_keys`.
+5. **`backend`** must be healthy before `opa` starts (inverted `depends_on`). `system_authz.rego`, `studio_authz.rego`, and `data.platform_keys` all travel in the bundle the backend serves — see step 6.
 6. **`backend`** starts and, in order:
    - `ensureSchema` (Postgres tables + audit-session trigger).
    - `audit.loadOrInitSigningKey` (creates / reconciles `audit-signing` in Vault, caches pubkey).
    - `ensurePlatformDefaults` (idempotent): seeds the default `platform` org + five built-in roles (`root`, `org_admin`, `policy_author`, `auditor`, `viewer`); promotes any pre-RBAC `role='admin'` users to `is_root` and pins them to `platform`.
    - `bootstrapInitialAdmin` (creates admin user pinned to `platform` org + `root` role + signed **genesis** audit row inside one transaction). Banner prints credentials, org, and role.
    - `platformKeys.loadOrInitPlatformKeys` (creates / reconciles `opa-auth-signing`, `session-signing`, `pep-opa-auth-signing` in Vault, registers their fingerprints in `platform_signing_keys` via `withAudit`).
-   - cross-checks Vault pubkey ↔ DB row ↔ on-disk trust file; mismatch sets `trustBroken` and `studio.authz` freezes mutations.
-   - restores stored policies to OPA, publishes `data.studio.policy_index` / `studio.keys` / `studio.callers` / `platform_keys`, starts JWKS fetcher.
-7. **`pep`** starts, reads `pep_token`, creates a Vault-backed signer for `pep-opa-auth-signing`, mints a fresh EdDSA JWT (aud=`opa-studio-pep`) per request to OPA — system_authz restricts the Aegis Sentry aud to read-only paths.
-8. **`frontend`** starts last, serves the SPA on `:3000` and proxies `/api` to backend.
+   - cross-checks Vault pubkey ↔ DB row; mismatch sets `trustBroken` and `studio.authz` freezes mutations.
+   - **warms the OPA bundle** (`opaBundle.buildBundle`: authz Rego + active policies + `data.studio.policy_index` / `studio.keys` / `studio.callers` / `studio.caller_access` / `platform_keys`), flips `/healthz` to ready, starts the JWKS fetcher. Every later mutation just `invalidateBundle`s; the next OPA poll rebuilds.
+7. **`opa`** starts (only now that `backend` is healthy), boots from `opa/config.yaml`, and pulls `GET /bundle/aegis.tar.gz` with `opa_bundle_token`. Until the first bundle activates, `--authorization=basic` is fail-closed (denies all). It re-polls every 10-20s (ETag/304); a fleet of replicas all converge on the same revision.
+8. **`pep`** starts, reads `pep_token`, creates a Vault-backed signer for `pep-opa-auth-signing`, mints a fresh EdDSA JWT (aud=`opa-studio-pep`) per request to OPA — system_authz restricts the Aegis Sentry aud to read-only paths.
+9. **`frontend`** starts last, serves the SPA on `:3000` and proxies `/api` to backend.
 
 Key model — four KMS-held Ed25519 keys, distinct purposes, separate blast radii:
 
@@ -414,7 +407,7 @@ After login, the admin interface presents a state-of-the-art developer workspace
   - *Sandbox* — An interactive playground supporting a side-by-side **Target Rule** and **Mock Aegis Sentry Caller** selector dropdown grid. Selecting an Aegis Sentry caller dynamically injects its structured DB representation under `input.caller` in the payload JSON, synchronizes JWT claims (`sub`, `orgId`) to the Mock JWT Signer, and merges real caller fields during "Auto-fill". Features **Saved Scenarios** CRUD profiles (`localStorage` persisted), an automatic rule execution coverage percentage gauge, and a built-in cryptographic **Mock JWT Signer** utilizing native `SubtleCrypto` to mint valid HS256 tokens client-side and inject them directly into your evaluation input.
   - *History* — Standard version diff comparisons and one-click rollback triggers.
 - **Unified Cryptographic HUD**: Located in the TopBar, this shield-pulse badge opens an overlay detailing engine health, audit chain structural validation, and Aegis TrustVault platform key sync status. Features highly opaque, solid backing (`0.98` opacity) and high-visibility status states (`0.15`–`0.18` background opacities) to prevent overlay text bleeding and keep data extremely legible.
-- **Lock / Unlock** — Policies are never hard-deleted. Locking removes the policy from OPA so it stops enforcing; the row + version history stay. Unlocking re-pushes.
+- **Lock / Unlock** — Policies are never hard-deleted. Locking drops the policy from the next bundle so it stops enforcing (eventual — within one OPA poll, ~10-20s, not instant); the row + version history stay. Unlocking re-includes it.
 - **Audit log** — Sequence-ordered immutable record with a chain-verify button. For root: per-actor org column. For sub-admins: rows automatically filtered to their own org.
 - **Manage users** — CRUD, password reset, plus org + role + `is_root` selectors on create. Sub-admins are pinned to their own org; only root can target another org or grant super-admin.
 - **Organizations** (root only) — flat tenant list. Hard delete refuses if any users / policies / trust keys / Aegis Sentry callers / custom roles still belong to the org.
@@ -468,7 +461,7 @@ The compiler also accepts `verification`-family builtins directly if you need fi
    - `inline_jwk` — paste a JWK (auto-canonicalised through `node:crypto.createPublicKey`).
    - `inline_secret` — HMAC secret string.
    - `jwks_url` — BYO IdP. Per-row TTL, default 30s (`TRUST_KEYS_FETCH_INTERVAL_MS`). Failures preserve last known-good and record `jwks_last_error`.
-5. Save. The active set publishes to OPA at `data.studio.keys` immediately, so any policy referencing `data.studio.keys["<kid>"]` starts verifying with no redeploy.
+5. Save. The active set is carried in the next bundle at `data.studio.keys`, so any policy referencing `data.studio.keys["<kid>"]` starts verifying within one OPA poll — no redeploy.
 6. To rotate or retire a key, hit **Revoke** on the row — it disappears from the next publish, so live policies stop accepting tokens signed by it within one publish interval. **Delete** is only available after revoke; the audit trail of the trust material stays intact.
 
 Same actions over the API:
@@ -629,7 +622,7 @@ A complete handshake from the **Aegis Studio admin** provisioning a caller down 
    - **Revoke** — soft-delete. Aegis Sentry stops accepting that caller within the publish interval (~30s).
    - **Delete** — permanent, only available on revoked rows. Audit log retains the full history.
 
-The active set republishes to OPA at `data.studio.callers` on every mutation; no Aegis Sentry restart needed.
+The active set is carried in the bundle at `data.studio.callers`; every mutation invalidates it and the change reaches OPA on the next poll — no Aegis Sentry restart needed.
 
 Equivalent over the API (admin JWT required):
 
@@ -760,7 +753,7 @@ opa/                 system_authz.rego + studio_authz.rego (mounted, not editabl
 vault/               Vault server config + init sidecar
 scripts/             BYOK import CLI (import-key.js)
 postgres-init/       Mounted into postgres at /docker-entrypoint-initdb.d (first-boot SQL hooks)
-docker-compose.yml   Full stack (opa, postgres, vault, vault-init, opa-trust-init, backend, pep, frontend)
+docker-compose.yml   Full stack (opa, postgres, vault, vault-init, backend, pep, frontend)
 pep-swagger.yaml     OpenAPI spec for the PEP surface (/authorize, /discover, /healthz)
 FEATURES.md          Production-hardening backlog (by area)
 CLAUDE.md            Architecture deep-dive for contributors

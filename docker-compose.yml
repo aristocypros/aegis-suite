@@ -10,35 +10,39 @@ services:
     ports:
       - "8181:8181"
     volumes:
-      # Mount the studio's bundled system / application authz Rego policies.
-      # Loaded at OPA startup; cannot be overwritten via the studio UI.
-      - ./opa:/policies:ro
-      # Platform-trust JSON written by opa-trust-init BEFORE OPA starts.
-      # OPA loads this file at startup as data.platform_keys, which
-      # system_authz.rego consumes to verify the JWT every backend / PEP
-      # request carries. Mounted at a separate top-level path because
-      # Docker cannot create a subdirectory mountpoint underneath an RO
-      # bind mount (overlay refuses mkdirat on the RO layer).
-      - opa_trust:/trust:ro
+      # BUNDLE-PULL mode: OPA boots with ONLY this config and pulls everything
+      # (system/studio authz Rego + policies + data + platform_keys) from the
+      # backend's /bundle endpoint. It no longer mounts ./opa policies or a
+      # platform-trust JSON — those now travel inside the bundle.
+      - ./opa/config.yaml:/config/config.yaml:ro
+      # The bundle bearer token (opa_bundle_token) lives here; config.yaml
+      # reads it via credentials.bearer.token_path.
+      - vault_secrets:/vault/secrets:ro
     command:
       - "run"
       - "--server"
       - "--log-level=info"
       - "--addr=0.0.0.0:8181"
-      - "--set=decision_logs.console=true"
+      - "--config-file=/config/config.yaml"
       # Token-based authentication: extracts Authorization: Bearer <token>
       # into input.identity for every OPA REST request.
       - "--authentication=token"
       # Authorization gate: every request must pass data.system.authz.allow.
+      # Until the first bundle activates this is undefined → deny-all
+      # (fail-closed). /health is served before this gate.
       - "--authorization=basic"
-      # Load the bundled rego files + trust data at startup.
-      - "/policies/system_authz.rego"
-      - "/policies/studio_authz.rego"
-      - "/trust/platform_keys.json"
     depends_on:
-      opa-trust-init:
-        condition: service_completed_successfully
+      # INVERTED dependency: OPA now pulls its bundle from the backend, so the
+      # backend must be healthy (serving /bundle) first. vault-init provides
+      # the bundle token file OPA presents.
+      backend:
+        condition: service_healthy
+      vault-init:
+        condition: service_healthy
     healthcheck:
+      # The OPA image is minimal (no shell/wget) — this only confirms the
+      # binary runs. Bundle-activation readiness is fail-closed at the policy
+      # layer; the PEP tolerates an un-activated OPA per request.
       test: ["CMD", "/opa", "version"]
       interval: 5s
       timeout: 3s
@@ -107,42 +111,17 @@ services:
       - opa-net
     restart: unless-stopped
     healthcheck:
-      # All three tokens must be in place before downstream services can
-      # start: backend signs with backend_token, opa-trust-init reads with
-      # opa_trust_init_token, PEP signs with pep_token. pep_token is minted
-      # LAST in bootstrap.sh, so its presence is the gate.
-      test: ["CMD-SHELL", "test -f /vault/secrets/backend_token && test -f /vault/secrets/opa_trust_init_token && test -f /vault/secrets/pep_token"]
+      # All tokens must be in place before downstream services start: backend
+      # signs with backend_token, PEP signs with pep_token, OPA pulls the
+      # bundle with opa_bundle_token. opa_bundle_token is generated LAST in
+      # bootstrap.sh, so its presence is the gate.
+      # (opa_trust_init_token is still minted for backward-compat but unused —
+      # the opa-trust-init sidecar was removed in the bundle-pull migration.)
+      test: ["CMD-SHELL", "test -f /vault/secrets/backend_token && test -f /vault/secrets/pep_token && test -f /vault/secrets/opa_bundle_token"]
       interval: 2s
       timeout: 2s
       retries: 30
       start_period: 2s
-
-  opa-trust-init:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: aegis-trust-init
-    command: ["node", "scripts/opa-trust-init.js"]
-    depends_on:
-      vault-init:
-        condition: service_healthy
-    environment:
-      - KMS_PROVIDER=${KMS_PROVIDER:-vault}
-      - VAULT_ADDR=${VAULT_ADDR:-http://vault:8200}
-      - VAULT_TOKEN_FILE=/vault/secrets/opa_trust_init_token
-      # Match the env knobs the backend uses so rotations land on the same
-      # keyIds. Sensible defaults if unset.
-      - KMS_KEY_ID_OPA_AUTH=${KMS_KEY_ID_OPA_AUTH:-opa-auth-signing}
-      - KMS_KEY_ID_PEP_OPA_AUTH=${KMS_KEY_ID_PEP_OPA_AUTH:-pep-opa-auth-signing}
-      - OPA_TRUST_OUTPUT=/opa-trust/platform_keys.json
-    volumes:
-      - opa_trust:/opa-trust
-      - vault_secrets:/vault/secrets:ro
-    networks:
-      - opa-net
-    # One-shot — exit non-zero stops the chain so OPA never boots with a
-    # stale or missing trust file.
-    restart: "no"
 
   backend:
     build:
@@ -165,9 +144,12 @@ services:
       - KMS_KEY_ID_OPA_AUTH=${KMS_KEY_ID_OPA_AUTH:-opa-auth-signing}
       - KMS_KEY_ID_SESSION=${KMS_KEY_ID_SESSION:-session-signing}
       - KMS_KEY_ID_PEP_OPA_AUTH=${KMS_KEY_ID_PEP_OPA_AUTH:-pep-opa-auth-signing}
-      # Trust-file the opa-trust-init sidecar produced — read RO at boot to
-      # verify the file OPA loaded matches KMS+DB (tamper detection).
-      - OPA_TRUST_FILE=/opa-trust/platform_keys.json
+      # Bearer token OPA presents to GET /bundle — verified here (constant-time)
+      # before serving the secret-bearing bundle. Same vault_secrets volume.
+      - BUNDLE_TOKEN_FILE=/vault/secrets/opa_bundle_token
+      # Dir the bundle builder reads system_authz.rego / studio_authz.rego from
+      # (mounted ./opa below). They're baked into the bundle, not loaded by OPA.
+      - OPA_AUTHZ_DIR=/app/opa
       # Vault-provider env (used when KMS_PROVIDER=vault).
       - VAULT_ADDR=${VAULT_ADDR:-http://vault:8200}
       - VAULT_TRANSIT_KEY=${VAULT_TRANSIT_KEY:-audit-signing}
@@ -175,14 +157,24 @@ services:
     volumes:
       - bootstrap_secret:/data
       - vault_secrets:/vault/secrets:ro
-      - opa_trust:/opa-trust:ro
+      # Source of the authz Rego the backend folds into the bundle (read-only).
+      - ./opa:/app/opa:ro
     depends_on:
-      opa:
-        condition: service_healthy
+      # OPA dependency is INVERTED (opa now depends_on backend) so it's gone
+      # from here. The backend builds/serves the bundle without needing OPA.
       postgres:
         condition: service_healthy
       vault-init:
         condition: service_healthy
+    healthcheck:
+      # Readiness gate for OPA's depends_on. 200 once boot (schema + KMS +
+      # platform keys + initial bundle warm) completes. node:20-alpine ships
+      # busybox wget; a 503 (not-ready) exits non-zero → unhealthy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     networks:
       - opa-net
 
@@ -264,11 +256,7 @@ volumes:
   vault_data:
     driver: local
   # Shared between vault-init (writer) and consumers (read-only). Holds the
-  # unseal key + root token (init.json) and the per-service signer tokens.
+  # unseal key + root token (init.json), the per-service signer tokens, and
+  # the opa_bundle_token shared secret for the bundle endpoint.
   vault_secrets:
-    driver: local
-  # Shared between opa-trust-init (writer) and OPA + backend (read-only).
-  # Holds platform_keys.json, the public-key bundle OPA loads at boot to
-  # verify incoming JWTs.
-  opa_trust:
     driver: local

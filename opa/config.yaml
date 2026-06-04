@@ -1,0 +1,38 @@
+# OPA configuration — BUNDLE PULL mode.
+#
+# OPA no longer loads policies/data from CLI files. It boots with ONLY this
+# config and pulls a single signed-by-network bundle from Aegis Core (the
+# backend) at GET /bundle/aegis.tar.gz. Every OPA replica polls the same
+# bundle and converges, which is what makes horizontal scaling correct.
+#
+# The bundle carries system_authz.rego + studio_authz.rego + all compiled
+# policy modules + data.studio.* + data.platform_keys. Until the first bundle
+# activates, `--authorization=basic` (data.system.authz.allow undefined) means
+# OPA denies all gated REST traffic — fail-closed, which is what we want.
+#
+# Bundle fetching is an OUTBOUND request from OPA and is NOT subject to OPA's
+# own inbound system_authz. The endpoint carries cleartext HMAC secrets, so it
+# is bearer-authed: OPA presents the token below; the backend verifies it.
+
+services:
+  aegis_backend:
+    url: http://backend:3001
+    credentials:
+      bearer:
+        # Shared secret minted by vault-init into the vault_secrets volume,
+        # read directly from the file (never embedded in the image/config).
+        token_path: /vault/secrets/opa_bundle_token
+
+bundles:
+  aegis:
+    service: aegis_backend
+    resource: /bundle/aegis.tar.gz
+    # ~10-20s convergence. ETag/If-None-Match means an unchanged bundle is a
+    # cheap 304. Lower these if faster lock/revoke/rotation propagation is
+    # needed (at the cost of more polls).
+    polling:
+      min_delay_seconds: 10
+      max_delay_seconds: 20
+
+decision_logs:
+  console: true

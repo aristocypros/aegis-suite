@@ -1,8 +1,8 @@
 // jwksFetcher.js — background poller for trust-store rows whose source_kind
 // is 'jwks_url'. On each tick it fetches every due URL, picks the matching
 // kid out of the JWKS document, derives PEM, and updates the row in place.
-// If anything changed, it re-invokes publishTrustKeys so OPA sees the
-// refreshed material within one publish interval.
+// If anything changed, it invalidates the OPA bundle so the refreshed
+// material reaches the fleet on the next bundle poll.
 //
 // Refresh is deliberately NOT routed through withAudit: the JWKS-URL BYO
 // path is a high-volume background refresh, comparable to AUD-07's PEP

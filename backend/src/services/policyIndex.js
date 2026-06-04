@@ -113,7 +113,12 @@ export function extractInputPaths(rules) {
 // see policies in org B, even if input paths match). org_id is null for
 // global / root-owned policies; the PEP treats those as visible to all
 // callers in v1 (they're seeded by root and are platform-wide).
-export function buildPolicyIndex(policies) {
+// `generatedAt` is intentionally NOT a wall-clock by default: the policy
+// index is embedded in the OPA bundle, whose revision/ETag is a content hash.
+// A per-build `new Date()` would change the hash on every rebuild even when
+// the policy set is unchanged, defeating the 304-not-modified path. Callers
+// that genuinely want a timestamp (none currently) can pass one explicitly.
+export function buildPolicyIndex(policies, { generatedAt = null } = {}) {
   const list = (Array.isArray(policies) ? policies : [])
     .filter((p) => p && !p.locked)
     .map((p) => ({
@@ -123,11 +128,12 @@ export function buildPolicyIndex(policies) {
       description: p.description ?? null,
       org_id: p.orgId ?? null,
       requiredPaths: extractInputPaths(p.rules),
-    }));
+    }))
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
 
   return {
     version: 1,
-    generatedAt: new Date().toISOString(),
+    generatedAt,
     policies: list,
   };
 }

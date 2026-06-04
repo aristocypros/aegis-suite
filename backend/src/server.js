@@ -8,19 +8,19 @@
 // e.g. when Vault is sealed and audit.appendAudit throws — closes the TCP
 // connection with no response body.
 import "express-async-errors";
-import { randomUUID, randomBytes, createPublicKey } from "node:crypto";
+import { randomUUID, randomBytes, createPublicKey, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import express from "express";
 import cors from "cors";
 
 import { compile, validate } from "./services/regoCompiler.js";
 import * as opa from "./services/opaClient.js";
+import * as opaBundle from "./services/opaBundle.js";
 import * as store from "./services/storage.js";
 import * as auth from "./services/auth.js";
 import * as bootstrap from "./services/bootstrap.js";
 import * as audit from "./services/audit.js";
 import * as platformKeys from "./services/platformKeys.js";
-import { buildPolicyIndex } from "./services/policyIndex.js";
-import { publishValueFromRow } from "./services/trustKeys.js";
 import { startJwksFetcher } from "./services/jwksFetcher.js";
 import { createTrustKeysRouter } from "./routes/trustKeys.js";
 import { createPepCallersRouter } from "./routes/pepCallers.js";
@@ -71,10 +71,81 @@ function isUuid(s) {
 
 const PORT = process.env.PORT || 3001;
 
+// Flipped true at the end of the boot sequence. The container healthcheck
+// (GET /healthz) gates on it so OPA — which now depends_on the backend and
+// pulls its bundle from us — doesn't start before we can serve one.
+let _ready = false;
+
 // ─── Health ────────────────────────────────────────────────────────────────
 app.get("/api/health", async (_req, res) => {
   const opaHealth = await opa.health();
   res.json({ ok: true, opa: opaHealth });
+});
+
+// Container readiness probe (machine-to-machine, unauthenticated). 200 once
+// boot (schema + KMS + platform keys + initial bundle warm) has completed.
+app.get("/healthz", (_req, res) => {
+  res.status(_ready ? 200 : 503).json({ ready: _ready });
+});
+
+// ─── OPA bundle endpoint (machine-to-machine; bearer-authed) ────────────────
+// Every OPA replica polls this to pull the policy/data bundle (see
+// services/opaBundle.js). It replaces the old push model so a fleet of
+// stateless OPA replicas all converge to the same revision.
+//
+// SECURITY: the bundle carries cleartext HMAC secrets (caller + trust-key
+// secrets). This endpoint is therefore bearer-authed with a constant-time
+// compare and MUST stay on the internal network — it is mounted before
+// app.use(authenticate) (the puller is OPA, not a user) and must NEVER be
+// proxied through nginx. Fail-closed: with no token configured we refuse.
+const BUNDLE_TOKEN = (() => {
+  const f = process.env.BUNDLE_TOKEN_FILE;
+  if (f) {
+    try {
+      return readFileSync(f, "utf8").trim();
+    } catch (e) {
+      console.error(`[opa-bundle] could not read BUNDLE_TOKEN_FILE ${f}: ${e.message}`);
+    }
+  }
+  if (process.env.BUNDLE_TOKEN) return process.env.BUNDLE_TOKEN.trim();
+  return null;
+})();
+
+function bundleAuthOk(req) {
+  if (!BUNDLE_TOKEN) return false;
+  const m = /^Bearer\s+(.+)$/i.exec(req.get("authorization") || "");
+  if (!m) return false;
+  const presented = Buffer.from(m[1].trim(), "utf8");
+  const expected = Buffer.from(BUNDLE_TOKEN, "utf8");
+  // timingSafeEqual requires equal lengths; bail (still constant-ish) if not.
+  if (presented.length !== expected.length) return false;
+  return timingSafeEqual(presented, expected);
+}
+
+app.get("/bundle/aegis.tar.gz", async (req, res) => {
+  if (!BUNDLE_TOKEN) {
+    return res.status(503).json({ error: "bundle endpoint not configured (no BUNDLE_TOKEN)" });
+  }
+  if (!bundleAuthOk(req)) {
+    res.set("WWW-Authenticate", "Bearer");
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  let bundle;
+  try {
+    bundle = await opaBundle.getBundle();
+  } catch (e) {
+    console.error(`[opa-bundle] build failed: ${e.message}`);
+    return res.status(500).json({ error: "bundle build failed" });
+  }
+  const etag = `"${bundle.revision}"`;
+  res.set("ETag", etag);
+  res.set("Cache-Control", "no-store");
+  // OPA sends If-None-Match once it holds a revision; 304 skips re-download.
+  if ((req.get("if-none-match") || "") === etag) {
+    return res.status(304).end();
+  }
+  res.set("Content-Type", "application/gzip");
+  res.status(200).send(bundle.tarGz);
 });
 
 // Public JWKS exposing the platform Ed25519 signing keys:
@@ -589,180 +660,44 @@ app.get("/api/policies/:id/versions/:versionNum", async (req, res) => {
   res.json(entry);
 });
 
-// Publish the discovery index to OPA at data.studio.policy_index. Read by the
-// PEP's /discover endpoint. Best-effort: a transient failure here does not
-// fail the calling request — the next successful publish brings it back into
-// sync (and the startup restore loop also republishes on every boot).
-async function publishPolicyIndex(reason) {
+// ─── OPA state distribution: bundle pull, not push ──────────────────────────
+// Policies and data documents (policy_index / keys / callers / caller_access /
+// platform_keys) are NO LONGER pushed to OPA. They are assembled into a bundle
+// (services/opaBundle.js) that every OPA replica pulls from GET /bundle. A
+// mutation just invalidates the cached bundle; the next poll rebuilds and the
+// whole fleet converges. `invalidateBundle` is the single replacement for the
+// old publish* functions and keeps the same fire-and-forget call shape.
+const invalidateBundle = (reason) => opaBundle.invalidateBundle(reason);
+
+// Bundle-safety probe: a compiled policy that OPA can't parse would, under
+// bundle mode, fail activation of the WHOLE bundle (blast radius: the entire
+// fleet stops updating). The JS compiler is the security boundary and is
+// trusted to emit valid Rego, but we additionally probe each new/updated
+// policy against the backend's live OPA by pushing a throwaway module under a
+// reserved `__validate_` package (outside every bundle root, so the write is
+// allowed) and deleting it. OPA actively rejecting it → 400 to the author so
+// the bad module never reaches the DB or the bundle. OPA unreachable / 5xx →
+// skip (don't block authoring; the bundle remains the source of truth).
+async function assertRegoCompilesInOpa(spec) {
+  const tempId = `__validate_${Date.now()}`;
+  let tempRego;
   try {
-    const all = await store.listPolicies();
-    const index = buildPolicyIndex(all);
-    await opa.putData("studio/policy_index", index);
-    console.log(
-      `[policy-index] published ${index.policies.length} active policies (${reason})`
-    );
-  } catch (e) {
-    console.warn(`[policy-index] publish failed (${reason}): ${e.message}`);
+    tempRego = compile({ ...spec, package: tempId });
+  } catch {
+    return; // JS compile error is handled by the caller's own compile() call
   }
-}
-
-// CRY-03: publish the platform trust store to OPA at data.studio.keys. The
-// compiler emits `data.studio.keys[kid]` directly as the cert: argument to
-// io.jwt.decode_verify (asymmetric) or as the HMAC secret arg, so the
-// document is a flat { [kid]: string } map of PEM/secret values. Revoked
-// rows are dropped from the publish; the next successful re-publish takes
-// effect on the next OPA evaluation. Same best-effort policy as
-// publishPolicyIndex — transport errors are logged and the next call
-// converges.
-async function publishTrustKeys(reason) {
   try {
-    const rows = await store.listTrustKeys();
-    const out = {};
-    let skipped = 0;
-    for (const row of rows) {
-      const v = publishValueFromRow(row);
-      if (typeof v === "string" && v.length > 0) out[row.kid] = v;
-      else if (row.status === "active") skipped++;
-    }
-    await opa.putData("studio/keys", out);
-    const note = skipped > 0 ? ` (skipped ${skipped} unhydrated)` : "";
-    console.log(`[trust-keys] published ${Object.keys(out).length} keys${note} (${reason})`);
+    await opa.putPolicy(tempId, tempRego);
+    await opa.deletePolicy(tempId).catch(() => {});
   } catch (e) {
-    console.warn(`[trust-keys] publish failed (${reason}): ${e.message}`);
-  }
-}
-
-// PEP-01: publish the active PEP caller set to OPA at data.studio.callers.
-// The PEP reads this document to authenticate inbound requests (caller_id
-// lookup for hmac mode, CN allowlist for mtls, subject pin for jwt). Same
-// best-effort policy as the other publishers — transport errors are logged
-// and the next call converges; the startup restore loop republishes.
-//
-// Revoked rows are intentionally omitted: the PEP stops accepting them on
-// the next publish (within ~30s), without needing to track per-row status.
-async function publishPepCallers(reason) {
-  try {
-    const rows = await store.listPepCallers();
-    const out = {};
-    for (const r of rows) {
-      if (r.status !== "active") continue;
-      // auth_mode is the contract between the studio and the PEP dispatcher:
-      // the PEP rejects a request whose presented credential kind disagrees
-      // with the row's declared mode. We always emit it so the PEP never has
-      // to infer the mode from which fields happen to be present.
-      const entry = { auth_mode: r.authMode };
-      if (r.authMode === "hmac" && r.hmacSecret) entry.hmac_secret = r.hmacSecret;
-      if (r.authMode === "mtls" && r.allowedCn) entry.allowed_cn = r.allowedCn;
-      if (r.authMode === "jwt" && r.jwtSubject) entry.jwt_subject = r.jwtSubject;
-      if (r.tenant) entry.tenant = r.tenant;
-      // org_id ties the caller to its org. The PEP uses this to filter
-      // /discover results: a caller in org A only sees policies in org A
-      // (or global policies with org_id=null). Always emitted so the PEP
-      // doesn't have to default on missing-field semantics.
-      entry.org_id = r.orgId ?? null;
-      out[r.callerId] = entry;
+    await opa.deletePolicy(tempId).catch(() => {});
+    if (e.status && e.status >= 400 && e.status < 500) {
+      const err = new Error(e.message);
+      err.code = "OPA_REGO_REJECTED";
+      err.body = e.body;
+      throw err;
     }
-    await opa.putData("studio/callers", out);
-    console.log(`[pep-callers] published ${Object.keys(out).length} callers (${reason})`);
-  } catch (e) {
-    console.warn(`[pep-callers] publish failed (${reason}): ${e.message}`);
-  }
-}
-
-// Per-caller policy access list — the PEP filters /discover and rejects
-// /authorize against this document. Shape: { [callerId]: [policyId, ...] }.
-//
-// The published allowlist is computed at publish time as the UNION of two
-// sources, so the PEP only ever sees the final answer:
-//
-//   1) Explicit grants in pep_caller_policy_access (audit-logged).
-//   2) Tag matches: every active policy whose `tags` overlap the caller's
-//      `scope_tags`. New policies tagged later auto-appear in the caller's
-//      allowlist on the next publish without an admin action.
-//
-// Locked policies are filtered out of BOTH sources so the published doc
-// never advertises a policy the PEP can't currently service. Underlying
-// DB rows stay; the next publish after unlock restores them.
-async function publishCallerAccess(reason) {
-  try {
-    const [grants, policies, callers] = await Promise.all([
-      store.listAllCallerAccess(),
-      store.listPolicies(),
-      store.listPepCallers(),
-    ]);
-    const activePolicyById = new Map(
-      policies.filter((p) => !p.locked).map((p) => [p.id, p])
-    );
-
-    // Per-caller Set of granted policy ids — Set dedupes the overlap
-    // between explicit grants and tag matches.
-    const allowed = new Map();
-    const explicitCount = new Map();
-    const tagCount = new Map();
-    function add(callerId, policyId, source) {
-      let set = allowed.get(callerId);
-      if (!set) { set = new Set(); allowed.set(callerId, set); }
-      const newlyAdded = !set.has(policyId);
-      set.add(policyId);
-      if (newlyAdded || source === "explicit") {
-        if (source === "explicit") {
-          explicitCount.set(callerId, (explicitCount.get(callerId) ?? 0) + 1);
-        } else {
-          tagCount.set(callerId, (tagCount.get(callerId) ?? 0) + 1);
-        }
-      }
-    }
-
-    // 1) Explicit grants — drop any pointing at locked policies.
-    for (const g of grants) {
-      if (!activePolicyById.has(g.policyId)) continue;
-      add(g.callerId, g.policyId, "explicit");
-    }
-
-    // 2) Tag matches — only for active callers with non-empty scope_tags.
-    for (const c of callers) {
-      if (c.status !== "active") continue;
-      if (!c.scopeTags || c.scopeTags.length === 0) continue;
-      const scope = new Set(c.scopeTags);
-      for (const [pid, p] of activePolicyById) {
-        if (!p.tags || p.tags.length === 0) continue;
-        if (p.tags.some((t) => scope.has(t))) {
-          add(c.callerId, pid, "tag");
-        }
-      }
-    }
-
-    const out = Object.fromEntries(
-      [...allowed.entries()].map(([cid, set]) => [cid, [...set]])
-    );
-    await opa.putData("studio/caller_access", out);
-    const totalGrants = Object.values(out).reduce((n, arr) => n + arr.length, 0);
-    const explicitTotal = [...explicitCount.values()].reduce((a, b) => a + b, 0);
-    const tagTotal = totalGrants - explicitTotal;
-    console.log(
-      `[caller-access] published ${Object.keys(out).length} caller scopes ` +
-        `(${totalGrants} grants: ${explicitTotal} explicit, ${tagTotal} via tags) (${reason})`
-    );
-  } catch (e) {
-    console.warn(`[caller-access] publish failed (${reason}): ${e.message}`);
-  }
-}
-
-// Publish the active + retired platform signing keys to OPA at
-// data.platform_keys. system_authz.rego reads this document to verify the
-// JWTs the backend and PEP attach to every request. Same best-effort
-// semantics as the other publishers: a transport failure here is logged
-// and the next call (or startup restore) brings OPA back in sync.
-async function publishPlatformKeys(reason) {
-  try {
-    const doc = await platformKeys.buildOpaPublishDocument();
-    await opa.putData("platform_keys", doc);
-    const counts = Object.entries(doc)
-      .map(([p, m]) => `${p}=${Object.keys(m).length}`)
-      .join(", ");
-    console.log(`[platform-keys] published (${counts}) (${reason})`);
-  } catch (e) {
-    console.warn(`[platform-keys] publish failed (${reason}): ${e.message}`);
+    console.warn(`[policy] OPA validation probe skipped (${e.message})`);
   }
 }
 
@@ -814,13 +749,18 @@ app.post("/api/policies", authorize("create", "policy", {
     return res.status(400).json({ error: `Compile failed: ${e.message}` });
   }
 
+  // Probe the compiled Rego against OPA so a module OPA can't parse is
+  // rejected here (400) rather than later bricking the whole bundle.
   try {
-    await opa.putPolicy(spec.id, rego);
+    await assertRegoCompilesInOpa(spec);
   } catch (e) {
-    return res.status(400).json({
-      error: `OPA rejected the policy: ${e.message}`,
-      opaResponse: e.body,
-    });
+    if (e.code === "OPA_REGO_REJECTED") {
+      return res.status(400).json({
+        error: `OPA rejected the policy: ${e.message}`,
+        opaResponse: e.body,
+      });
+    }
+    throw e;
   }
 
   let savedId;
@@ -841,7 +781,7 @@ app.post("/api/policies", authorize("create", "policy", {
   // list endpoint would (root sees the row regardless; the org-admin
   // creator always sees their own org's row).
   const saved = await store.getPolicy(savedId, req.user);
-  publishPolicyIndex("policy.create");
+  invalidateBundle("policy.create");
   res.json(saved);
 });
 
@@ -858,13 +798,17 @@ app.put("/api/policies/:id", authorize("update", "policy"), async (req, res) => 
     return res.status(400).json({ error: `Compile failed: ${e.message}` });
   }
 
+  // Probe the compiled Rego against OPA (see create route) before persisting.
   try {
-    await opa.putPolicy(spec.id, rego);
+    await assertRegoCompilesInOpa(spec);
   } catch (e) {
-    return res.status(400).json({
-      error: `OPA rejected the policy: ${e.message}`,
-      opaResponse: e.body,
-    });
+    if (e.code === "OPA_REGO_REJECTED") {
+      return res.status(400).json({
+        error: `OPA rejected the policy: ${e.message}`,
+        opaResponse: e.body,
+      });
+    }
+    throw e;
   }
 
   let savedId;
@@ -890,7 +834,7 @@ app.put("/api/policies/:id", authorize("update", "policy"), async (req, res) => 
     throw e;
   }
   const saved = await store.getPolicy(savedId);
-  publishPolicyIndex("policy.update");
+  invalidateBundle("policy.update");
   res.json(saved);
 });
 
@@ -899,8 +843,14 @@ app.put("/api/policies/:id", authorize("update", "policy"), async (req, res) => 
 //   - bump the policy's version
 //   - emit a policy_versions snapshot
 //   - audit as policy.lock / policy.unlock
-//   - mutate OPA: lock → opa.deletePolicy (module unloaded; default-deny);
-//                 unlock → opa.putPolicy (module re-pushed; enforcement resumes)
+//   - rebuild the bundle: buildPolicyIndex / the bundle module list both drop
+//     locked policies, so on the next OPA poll the locked policy stops being
+//     served (default-deny) fleet-wide; unlock re-includes it.
+// NOTE on propagation: under bundle pull, lock is EVENTUAL — it takes effect
+// within one OPA poll interval (~10-20s) plus the PEP's own caller cache TTL,
+// not instantly. A bundle-owned policy module cannot be REST-deleted from OPA
+// (OPA owns bundle roots), so there is no instant per-replica kill-switch as
+// there was under the push model; shorten the poll if a faster kill matters.
 // Idempotent: relocking a locked policy or unlocking an unlocked policy
 // returns the current state with version unchanged and no audit entry.
 async function handleSetLocked(req, res, locked) {
@@ -952,26 +902,11 @@ async function handleSetLocked(req, res, locked) {
     throw e;
   }
 
-  // The audit entry committed; now reflect the change in OPA.
-  // OPA mutations happen AFTER the DB commit, so a transient OPA outage
-  // doesn't poison the chain — the next backend boot's restore loop will
-  // bring OPA back in sync (unless the policy is now locked, in which case
-  // it's intentionally absent from OPA).
-  if (locked) {
-    await opa.deletePolicy(req.params.id).catch((e) => {
-      console.warn(`[lock] OPA delete failed for ${req.params.id}: ${e.message}`);
-    });
-  } else if (result?.rego) {
-    try {
-      await opa.putPolicy(req.params.id, result.rego);
-    } catch (e) {
-      console.warn(`[unlock] OPA put failed for ${req.params.id}: ${e.message}`);
-    }
-  }
-  publishPolicyIndex(locked ? "policy.lock" : "policy.unlock");
-  // Locked policies are filtered out of the published caller_access doc so
-  // the PEP stops admitting calls against them within the next refresh.
-  publishCallerAccess(locked ? "policy.lock" : "policy.unlock");
+  // The audit entry committed; now reflect the change in the bundle. The
+  // rebuild drops (lock) or restores (unlock) the policy module AND updates
+  // policy_index + caller_access (both filter out locked policies), so the
+  // PEP stops/starts admitting calls against it on the next poll.
+  invalidateBundle(locked ? "policy.lock" : "policy.unlock");
   res.json(result);
 }
 
@@ -1017,7 +952,7 @@ app.patch("/api/policies/:id/tags", authorize("update", "policy"), async (req, r
     };
   });
 
-  publishCallerAccess("policy.tags.update");
+  invalidateBundle("policy.tags.update");
   res.json({ id: req.params.id, tags: result?.tags ?? nextTags });
 });
 
@@ -1042,41 +977,44 @@ app.all("/api/policies/:id", (req, res, next) => {
 });
 
 // ─── Trust keys (CRY-03) ───────────────────────────────────────────────────
-// Admin-managed public-key trust store published to OPA at data.studio.keys.
-// Policies reference it via verify conditions with keyRef.source="data.studio.keys".
-app.use("/api/trust-keys", createTrustKeysRouter({ publish: publishTrustKeys }));
+// Admin-managed public-key trust store carried in the bundle at
+// data.studio.keys. Policies reference it via verify conditions with
+// keyRef.source="data.studio.keys". Mutations invalidate the bundle.
+app.use("/api/trust-keys", createTrustKeysRouter({ publish: invalidateBundle }));
 
 // ─── PEP callers (PEP-01) ──────────────────────────────────────────────────
 // Admin-managed caller identities for the PEP's /authorize and /discover
-// surfaces. Active rows are published to OPA at data.studio.callers; the
+// surfaces. Active rows are carried in the bundle at data.studio.callers; the
 // PEP reads that doc on every request to authenticate the caller.
 app.use("/api/pep-callers", createPepCallersRouter({
-  publish: publishPepCallers,
-  publishAccess: publishCallerAccess,
+  publish: invalidateBundle,
+  publishAccess: invalidateBundle,
 }));
 
 // ─── Caller access list (PEP ACL) ──────────────────────────────────────────
 // Per-caller policy allowlist nested under each pep caller. Granted policies
-// are published to OPA at data.studio.caller_access; the PEP enforces both
-// /authorize and /discover against this document.
+// are carried in the bundle at data.studio.caller_access; the PEP enforces
+// both /authorize and /discover against this document.
 app.use(
   "/api/pep-callers/:callerId/access",
-  createCallerAccessRouter({ publish: publishCallerAccess })
+  createCallerAccessRouter({ publish: invalidateBundle })
 );
 
 // Reverse view of the same M:N relation, scoped to one policy. Shares the
-// same audit actions and publisher as the caller-centric route.
+// same audit actions and bundle invalidation as the caller-centric route.
 app.use(
   "/api/policies/:policyId/access",
-  createPolicyCallersRouter({ publish: publishCallerAccess })
+  createPolicyCallersRouter({ publish: invalidateBundle })
 );
 
 // ─── Platform signing keys ─────────────────────────────────────────────────
 // Admin-managed lifecycle for the KMS-held keys that the backend uses to
 // authenticate to OPA and sign session JWTs (plus the PEP's OPA-auth key).
-// Rotation re-publishes data.platform_keys; revoke flips a retired row to
-// revoked and re-publishes (dropping it from OPA's accepted set).
-app.use("/api/platform-keys", createPlatformKeysRouter({ publish: publishPlatformKeys }));
+// Rotation/revoke carry data.platform_keys in the bundle. NOTE: rotation is
+// special — it must CONFIRM OPA has activated the new pubkey before flipping
+// the active signer (the route handles this poll-aware sequence itself), so
+// here we only wire bundle invalidation.
+app.use("/api/platform-keys", createPlatformKeysRouter({ publish: invalidateBundle }));
 
 app.use("/api/orgs",  createOrgsRouter());
 app.use("/api/roles", createRolesRouter());
@@ -1170,9 +1108,9 @@ app.use((err, _req, res, _next) => {
 });
 
 // Belt-and-suspenders: rejections that originate OUTSIDE a request lifecycle
-// (e.g. fire-and-forget publishPolicyIndex calls, the startup OPA-restore
-// loop) wouldn't hit the express error middleware. Log and keep the process
-// alive so the next request can succeed.
+// (e.g. fire-and-forget invalidateBundle calls, the JWKS background fetcher)
+// wouldn't hit the express error middleware. Log and keep the process alive
+// so the next request can succeed.
 process.on("unhandledRejection", (err) => {
   console.error(`[unhandledRejection] ${err?.stack || err?.message || err}`);
 });
@@ -1210,21 +1148,11 @@ app.listen(PORT, async () => {
       // platform_signing_keys; create rows on first sight; mark
       // per-purpose trust broken on fingerprint mismatch.
       await platformKeys.loadOrInitPlatformKeys();
-      // Cross-check against the file OPA loaded at boot. Pure read; logs
-      // any drift but doesn't fail startup — the data-publish loop below
-      // will re-converge OPA's view after every restart.
-      const trustFilePath =
-        process.env.OPA_TRUST_FILE || "/opa-trust/platform_keys.json";
-      try {
-        const issues = await platformKeys.reconcileWithTrustFile(trustFilePath);
-        if (issues.length) {
-          console.warn(
-            `[platform-keys] OPA trust file drift detected:\n  - ${issues.join("\n  - ")}`
-          );
-        }
-      } catch (e) {
-        console.warn(`[platform-keys] trust-file probe skipped: ${e.message}`);
-      }
+      // (Pre-bundle builds cross-checked a boot-time /opa-trust/platform_keys.json
+      // written by the opa-trust-init sidecar. That sidecar + file are gone —
+      // platform_keys now travels in the bundle the backend builds from KMS+DB.
+      // Live drift between the DB and what OPA serves is surfaced on demand by
+      // GET /api/platform-keys/opa-state.)
       const trust = platformKeys.isTrustOk();
       if (!trust.ok) {
         console.error(
@@ -1240,47 +1168,36 @@ app.listen(PORT, async () => {
     console.error("Schema / bootstrap failed:", e.message);
   }
 
-  // 2. Wait for OPA to be reachable.
-  let tries = 0;
-  while (tries < 30) {
-    const h = await opa.health();
-    if (h.ok) break;
-    await new Promise((r) => setTimeout(r, 1000));
-    tries++;
-  }
-
-  // 3. Seeding + restoring policies into OPA.
+  // 2. Seed templates (optional) and WARM the bundle. We no longer wait for
+  //    OPA or push policies into it — under bundle pull, OPA depends_on this
+  //    backend and pulls GET /bundle on its own. Warming the cache here means
+  //    OPA's first poll gets an immediate 200 at the right revision rather
+  //    than paying a cold-build latency spike.
   try {
     if (process.env.SEED_TEMPLATES === "true") {
       await seedTemplates();
     } else {
       console.log("Template seeding disabled (SEED_TEMPLATES != true). Skipping.");
     }
-    const stored = await store.listPolicies();
-    let pushed = 0;
-    let skippedLocked = 0;
-    for (const p of stored) {
-      if (p.locked) { skippedLocked++; continue; }
-      if (p.rego) {
-        try { await opa.putPolicy(p.id, p.rego); pushed++; }
-        catch (e) { console.error(`Failed to restore ${p.id}: ${e.message}`); }
-      }
+    try {
+      const { revision } = await opaBundle.buildBundle();
+      console.log(`[startup] OPA bundle warmed at revision ${revision.slice(0, 12)}`);
+    } catch (e) {
+      // Non-fatal: the bundle is lazily (re)built on the next GET /bundle.
+      // OPA stays fail-closed (denies all) until it activates a bundle.
+      console.error(`[startup] initial bundle build failed (will retry on poll): ${e.message}`);
     }
-    console.log(
-      `Restored ${pushed} policies to OPA` +
-        (skippedLocked ? ` (skipped ${skippedLocked} locked)` : "")
-    );
-    await publishPolicyIndex("startup.restore");
-    await publishTrustKeys("startup.restore");
-    await publishPepCallers("startup.restore");
-    await publishCallerAccess("startup.restore");
-    await publishPlatformKeys("startup.restore");
-    // CRY-03: background poller for jwks_url-sourced trust keys. The handle
-    // is not retained — Node will tear it down on process exit, and unref()
-    // inside the fetcher keeps it from holding the event loop open.
+    // CRY-03: background poller for jwks_url-sourced trust keys. On a change
+    // it invalidates the bundle so the refreshed key reaches OPA on the next
+    // poll. The handle is not retained — unref() inside the fetcher keeps it
+    // from holding the event loop open.
     const intervalMs = parseInt(process.env.TRUST_KEYS_FETCH_INTERVAL_MS, 10) || 30000;
-    startJwksFetcher({ publish: publishTrustKeys, intervalMs });
+    startJwksFetcher({ publish: invalidateBundle, intervalMs });
   } catch (e) {
     console.error("Seeding failed:", e.message);
   }
+
+  // Boot complete — flip readiness so the container healthcheck (and thus
+  // OPA's depends_on) goes green and OPA can start pulling the bundle.
+  _ready = true;
 });

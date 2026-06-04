@@ -126,6 +126,29 @@ const MAX_INLINE_SECRET_LEN = 1024;
 // quoted literal, and the literal must match this regex).
 export const SELECTOR_LITERAL_RE = /^[\w.-]+$/;
 
+// Package roots that the OPA bundle owns (system_authz / studio_authz / the
+// published data documents) plus the `__preview_` namespace used by the
+// transient preview-evaluate push. A user policy whose first package segment
+// collides with one of these would overlap a declared bundle root and make
+// OPA reject the ENTIRE bundle as a root conflict — bricking the whole PDP
+// fleet. Refuse such packages at compile and validate time. `__preview_`
+// must stay reserved so the preview path can keep pushing temp modules
+// OUTSIDE the bundle roots (see /api/preview-evaluate).
+export const RESERVED_PACKAGE_ROOTS = new Set(["system", "studio", "platform_keys"]);
+
+// Returns an error string if `pkg`'s first segment is reserved, else null.
+export function reservedPackageRootError(pkg) {
+  if (typeof pkg !== "string" || pkg.length === 0) return null;
+  const root = pkg.split(".")[0];
+  if (root.startsWith("__preview_")) {
+    return `Reserved package root '__preview_*' (used internally for preview evaluation): ${pkg}`;
+  }
+  if (RESERVED_PACKAGE_ROOTS.has(root)) {
+    return `Reserved package root '${root}' (owned by the OPA bundle): ${pkg}`;
+  }
+  return null;
+}
+
 const IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const OBJECT_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const CMP_OPS_SET = new Set(["==", "!=", "<", "<=", ">", ">="]);
@@ -1059,6 +1082,8 @@ export function compile(spec) {
   if (!spec.package || typeof spec.package !== "string") {
     throw new Error("Spec must have a 'package' string");
   }
+  const reserved = reservedPackageRootError(spec.package);
+  if (reserved) throw new Error(reserved);
   if (!Array.isArray(spec.rules)) {
     throw new Error("Spec must have a 'rules' array");
   }
@@ -1099,6 +1124,9 @@ export function validate(spec) {
     if (!spec.package) errors.push("Missing 'package'");
     else if (!/^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$/.test(spec.package)) {
       errors.push(`Invalid package path: ${spec.package}`);
+    } else {
+      const reserved = reservedPackageRootError(spec.package);
+      if (reserved) errors.push(reserved);
     }
     if (!Array.isArray(spec.rules)) errors.push("Missing 'rules' array");
     else {

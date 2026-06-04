@@ -11,7 +11,34 @@ import { Router } from "express";
 import * as store from "../services/storage.js";
 import * as platformKeys from "../services/platformKeys.js";
 import * as opa from "../services/opaClient.js";
+import * as opaBundle from "../services/opaBundle.js";
 import { authorize } from "../middleware/authorize.js";
+
+// How long rotation waits for OPA to ACTIVATE a bundle carrying the new
+// pubkey before flipping the in-memory signer. Must comfortably exceed the
+// OPA bundle poll's max_delay_seconds (default 20s). Configurable for tests.
+const ROTATE_ACTIVATION_TIMEOUT_MS =
+  parseInt(process.env.PLATFORM_KEY_ROTATE_TIMEOUT_MS, 10) || 35000;
+const ROTATE_POLL_INTERVAL_MS = 2000;
+
+// Poll OPA's live data.platform_keys until it carries `fpHex` under `purpose`,
+// i.e. OPA has activated a bundle that trusts the new key. Returns true on
+// success, false on timeout. Read-only; never throws (transport errors are
+// treated as "not yet").
+async function waitForOpaPlatformKey(purpose, fpHex, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const doc = await opa.getData("platform_keys");
+      const live = doc?.result || {};
+      if (live[purpose] && live[purpose][fpHex]) return true;
+    } catch {
+      /* OPA momentarily unreachable / mid-activation — keep polling */
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, ROTATE_POLL_INTERVAL_MS));
+  }
+}
 
 // Factory: routes need the publish callback wired from server.js so they
 // can re-emit data.platform_keys after the audited mutation commits.
@@ -79,14 +106,56 @@ export function createPlatformKeysRouter({ publish }) {
         error: `purpose must be one of: ${platformKeys.PURPOSES.join(", ")}`,
       });
     }
-    const result = await platformKeys.rotate(purpose, { actor: req.user });
-    // Publish FIRST with the still-active old signing key, so OPA learns
-    // about the new pubkey. THEN flip the in-memory pointer so the next
-    // outgoing JWT is signed by the new key. For opa-auth-signing also
-    // flush the token cache so the very next call mints under the new
-    // key. (For session-signing the cache doesn't matter — issuance
-    // picks up activeKeyId per call.)
-    await publish("platform_key.rotate");
+    // Recovery: if a PRIOR rotate already minted the new key but timed out
+    // before OPA activated it (202 pending), the active DB row's fingerprint
+    // differs from the in-memory signer pointer. Re-issuing rotate must NOT
+    // mint yet another key — instead re-check activation of the pending key
+    // and commit. (After a backend restart this never trips: boot reconciles
+    // the signer pointer to the active DB row.)
+    const activeRow = await store.getActivePlatformKey(purpose);
+    const inMem = platformKeys.getActivePurposeMeta(purpose);
+    const pending =
+      activeRow && inMem && activeRow.fpHex !== inMem.fpHex
+        ? { newKeyId: activeRow.keyId, newFpHex: activeRow.fpHex, retiredFpHex: inMem.fpHex }
+        : null;
+
+    const result = pending || (await platformKeys.rotate(purpose, { actor: req.user }));
+    // Two-phase under bundle pull. rotate() registered the new pubkey (active
+    // in DB, cached for verification) but did NOT flip the in-memory SIGNING
+    // pointer. We must not flip it until OPA actually trusts the new pubkey —
+    // otherwise the next backend->OPA (or PEP->OPA for the pep key) JWT, signed
+    // by the new key, would fail system_authz until OPA's next poll.
+    //
+    // So: invalidate + eagerly rebuild the bundle (so the next poll serves the
+    // new revision immediately), then WAIT for OPA to activate it, and only
+    // then commitRotation(). The old key stays valid throughout (it's retired,
+    // not revoked, and buildOpaPublishDocument keeps retired keys), so existing
+    // tokens keep verifying during the wait.
+    publish("platform_key.rotate");
+    try {
+      await opaBundle.buildBundle();
+    } catch (e) {
+      console.warn(`[platform-key.rotate] eager bundle rebuild failed: ${e.message}`);
+    }
+    const activated = await waitForOpaPlatformKey(
+      purpose, result.newFpHex, ROTATE_ACTIVATION_TIMEOUT_MS
+    );
+    if (!activated) {
+      // Do NOT commit — the old key is still the active signer and remains
+      // valid, so nothing breaks. The new key is already in the DB + bundle;
+      // a follow-up rotate call re-checks activation and commits.
+      return res.status(202).json({
+        ok: false,
+        pending: true,
+        newFpHex: result.newFpHex,
+        retiredFpHex: result.retiredFpHex,
+        detail:
+          "Rotated in DB and bundle, but OPA has not yet activated the new " +
+          "pubkey within the timeout; the active signer was NOT flipped. " +
+          "Re-issue the rotate request to re-check activation and commit.",
+      });
+    }
+    // OPA now trusts the new key — safe to sign with it.
     platformKeys.commitRotation(purpose, result.newKeyId, result.newFpHex);
     if (purpose === "opa-auth-signing") {
       opa.invalidateAuthCache();

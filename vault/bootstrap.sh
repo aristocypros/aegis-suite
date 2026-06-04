@@ -36,7 +36,11 @@ OPA_TRUST_INIT_TOKEN_FILE="${SECRETS_DIR}/opa_trust_init_token"
 PEP_TOKEN_FILE="${SECRETS_DIR}/pep_token"
 
 mkdir -p "${SECRETS_DIR}"
-chmod 700 "${SECRETS_DIR}" 2>/dev/null || true
+# 0711 (not 0700): the non-root OPA container (uid 1000) must TRAVERSE this dir
+# to read its world-readable bundle token by exact path. `x`-for-others allows
+# traversal but not listing; every other secret stays 0600 and unreadable to
+# non-owners, so only the explicitly 0644 opa_bundle_token is exposed.
+chmod 711 "${SECRETS_DIR}" 2>/dev/null || true
 
 # ── Wait for vault to accept TCP connections ─────────────────────────────────
 ready=""
@@ -115,9 +119,13 @@ path "transit/keys/session-signing*" { capabilities = ["read", "update"] }
 path "transit/keys/session-signing*/import" { capabilities = ["update"] }
 path "transit/keys/session-signing*/rotate" { capabilities = ["update"] }
 
-# Backend tracks the PEP-OPA-auth pubkey in platform_signing_keys so the
-# audit chain attests its lifecycle, but never signs with it — read only.
-path "transit/keys/pep-opa-auth-signing*" { capabilities = ["read"] }
+# Backend MANAGES the PEP-OPA-auth key lifecycle (ensureKey at boot, rotate via
+# the platform-keys UI) and tracks its pubkey in platform_signing_keys, but
+# never SIGNS with it (no transit/sign/pep-* path). read+update covers create +
+# rotate; the absence of a sign grant keeps the PEP's key the PEP's to sign with.
+# (Before the bundle-pull migration the opa-trust-init sidecar created this key;
+# that sidecar is gone, so the backend creates it now.)
+path "transit/keys/pep-opa-auth-signing*" { capabilities = ["read", "update"] }
 
 path "transit/wrapping_key" { capabilities = ["read"] }
 EOF
@@ -173,6 +181,32 @@ mint_token() {
 mint_token "opa-studio-backend" "${BACKEND_TOKEN_FILE}"        "opa-studio-backend"
 mint_token "opa-trust-init"     "${OPA_TRUST_INIT_TOKEN_FILE}" "opa-trust-init"
 mint_token "pep-signer"         "${PEP_TOKEN_FILE}"            "opa-studio-pep"
+
+# ── Step 6: bundle endpoint shared secret ────────────────────────────────────
+# NOT a Vault auth token — an opaque random bearer the OPA replicas present to
+# the backend's GET /bundle endpoint (which carries cleartext HMAC secrets).
+# Both OPA (config.yaml credentials.bearer.token_path) and the backend
+# (BUNDLE_TOKEN_FILE) read this same file. Generated LAST so its presence gates
+# the vault-init healthcheck. od/-/dev/urandom are present in the alpine image.
+BUNDLE_TOKEN_FILE_OUT="${SECRETS_DIR}/opa_bundle_token"
+if [ -f "${BUNDLE_TOKEN_FILE_OUT}" ]; then
+  echo "[aegis-trustvault-init] bundle token already present"
+else
+  echo "[aegis-trustvault-init] generating opa_bundle_token"
+  BUNDLE_TOK=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n\t')
+  if [ -z "${BUNDLE_TOK}" ]; then
+    echo "[aegis-trustvault-init] FATAL: failed to generate bundle token" >&2
+    exit 1
+  fi
+  printf "%s" "${BUNDLE_TOK}" > "${BUNDLE_TOKEN_FILE_OUT}"
+  echo "[aegis-trustvault-init] wrote ${BUNDLE_TOKEN_FILE_OUT}"
+fi
+# 0644 (unlike the 0600 Vault tokens): the non-root OPA container reads this via
+# config.yaml token_path. Re-applied every boot so a pre-existing 0600 file from
+# an older bootstrap is corrected. Low exposure — the volume is shared only
+# among trusted platform containers and this bearer only authorizes pulling the
+# bundle (which is itself bearer-protected on the backend side).
+chmod 644 "${BUNDLE_TOKEN_FILE_OUT}" 2>/dev/null || true
 
 echo "[aegis-trustvault-init] setup complete; entering unseal watch loop (interval=${WATCH_INTERVAL}s)"
 
