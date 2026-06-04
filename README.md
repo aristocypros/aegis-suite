@@ -8,28 +8,55 @@ A visual builder that compiles JSON policy specs to Rego, deploys them to OPA, s
 flowchart TB
     subgraph Client ["Client Layer"]
         browser["Browser (React / Vite SPA)"]
-        client_pep["Client Service (Aegis Sentry Caller)"]
+        caller_a["Client Service (Org A Caller)"]
+        caller_b["Client Service (Org B Caller)"]
     end
 
-    subgraph Studio ["Aegis Policy Fabric Stack (Docker Compose / Kubernetes)"]
+    subgraph Studio ["Aegis Policy Fabric Control Plane"]
         frontend["frontend (Nginx Proxy) :3000"]
         backend["backend (Express API) :3001"]
-        pep["pep (Aegis Sentry) :3002"]
-        opa["opa (Open Policy Agent) :8181"]
         postgres[("postgres (Database) :5432")]
         vault["vault (Aegis TrustVault Provider)"]
         vault_init["vault-init (one-shot unseal)"]
     end
 
+    subgraph TenantA ["Physical Tenant Isolation: Org A"]
+        pep_a["pep-org-a (Aegis Sentry A)"]
+        opa_a["opa-org-a (OPA Org A)"]
+    end
+
+    subgraph TenantB ["Physical Tenant Isolation: Org B"]
+        pep_b["pep-org-b (Aegis Sentry B)"]
+        opa_b["opa-org-b (OPA Org B)"]
+    end
+
     browser -->|Proxy /api| frontend
     frontend --> backend
-    backend -->|Read/Write User, Org, Policy, Keys| postgres
-    backend -->|Compile & Restore Rego / Publish Indexes| opa
+    backend -->|Read/Write state| postgres
     backend -->|Transit crypt: Sign / Rotate| vault
-    client_pep -->|/authorize & /discover| pep
-    pep -->|Authenticate Caller & Proxy Authz| opa
-    pep -->|Transit crypt: Sign JWTs| vault
     vault_init -->|Unseal & Scoped Tokens| vault
+
+    %% Tenant A Bundle & Flow
+    backend -->|Serves Org A Bundle| bundle_a["Bundle org_a<br/>(/bundle/orgs/org-a-uuid/aegis.tar.gz)"]
+    bundle_a -.->|Pulled by Org A Fleet| opa_a
+    caller_a -->|/authorize & /discover| pep_a
+    pep_a -->|Authenticate & Query Authz| opa_a
+    pep_a -->|Transit crypt: Sign JWTs| vault
+
+    %% Tenant B Bundle & Flow
+    backend -->|Serves Org B Bundle| bundle_b["Bundle org_b<br/>(/bundle/orgs/org-b-uuid/aegis.tar.gz)"]
+    bundle_b -.->|Pulled by Org B Fleet| opa_b
+    caller_b -->|/authorize & /discover| pep_b
+    pep_b -->|Authenticate & Query Authz| opa_b
+    pep_b -->|Transit crypt: Sign JWTs| vault
+
+    classDef control fill:#2563eb,stroke:#3b82f6,color:#fff
+    classDef tenantA fill:#10b981,stroke:#059669,color:#fff
+    classDef tenantB fill:#f59e0b,stroke:#d97706,color:#fff
+    
+    class backend,postgres,vault,frontend control
+    class pep_a,opa_a tenantA
+    class pep_b,opa_b tenantB
 ```
 
 ## Services
@@ -39,7 +66,7 @@ flowchart TB
 | `frontend`   | 3000 → nginx:80 | React/Vite SPA. The Visual Builder, Sandbox, audit viewer, and admin pages. Proxies `/api` → backend. |
 | `backend`    | 3001            | Aegis Core Express API. Compiles specs → Rego, manages users / policies / trust keys / Aegis Sentry callers, signs the audit chain via Aegis TrustVault. |
 | `pep`        | 3002            | Aegis Sentry. Stateless `/authorize` + `/discover`. Authenticates callers (mTLS / HMAC / JWT) and forwards `input` to OPA. |
-| `opa`        | 8181            | Policy engine. Boots with only `opa/config.yaml` and **pulls** a bundle (policies + data + authz Rego + `platform_keys`) from the backend's `/bundle`. Gated by `system_authz` (EdDSA JWT per request) and consulted via `studio_authz` on mutating routes. Stateless — run as many replicas as you like; they all converge on the same bundle. |
+| `opa`        | 8181            | Policy engine. Boots with only `opa/config.yaml` and **pulls** a bundle (policies + data + authz Rego + `platform_keys`) from the backend's `/bundle/aegis.tar.gz` (global) or `/bundle/orgs/:orgId/aegis.tar.gz` (tenant-scoped) endpoint. Gated by `system_authz` (EdDSA JWT per request) and consulted via `studio_authz` on mutating routes. Stateless — run as many replicas as you like; they all converge on their respective bundle. |
 | `postgres`   | 5433 → 5432     | Users, orgs, roles, policies, versions, audit log, trust keys, Aegis Sentry callers. |
 | `vault`      | (internal)      | Default Aegis TrustVault provider. Holds the Ed25519 audit-signing key in Transit; the private key never leaves it. |
 | `vault-init` | (one-shot)      | Initialises Vault on first boot, mints the scoped signer tokens (`backend_token`, `pep_token`), and generates the `opa_bundle_token` shared secret OPA uses to pull the bundle. |
@@ -75,8 +102,8 @@ sequenceDiagram
     Backend->>Backend: Warms the OPA bundle (authz Rego + policies + data + platform_keys) → /healthz green
 
     Note over OPA: OPA starts only after backend is healthy (depends_on)
-    OPA->>Backend: GET /bundle/aegis.tar.gz (bearer = opa_bundle_token), polls every 10-20s
-    OPA->>OPA: Activates bundle (system_authz + data.platform_keys now live)
+    OPA->>Backend: GET /bundle/orgs/:orgId/aegis.tar.gz (bearer = opa_bundle_token), polls every 10-20s
+    OPA->>OPA: Activates tenant bundle (system_authz + data.platform_keys now live)
 
     PEP->>Vault: Reads pep_token, creates Transit JWT signer
     PEP->>OPA: Mints EdDSA JWT for queries to OPA
@@ -102,8 +129,10 @@ sequenceDiagram
    - `bootstrapInitialAdmin` (creates admin user pinned to `platform` org + `root` role + signed **genesis** audit row inside one transaction). Banner prints credentials, org, and role.
    - `platformKeys.loadOrInitPlatformKeys` (creates / reconciles `opa-auth-signing`, `session-signing`, `pep-opa-auth-signing` in Vault, registers their fingerprints in `platform_signing_keys` via `withAudit`).
    - cross-checks Vault pubkey ↔ DB row; mismatch sets `trustBroken` and `studio.authz` freezes mutations.
-   - **warms the OPA bundle** (`opaBundle.buildBundle`: authz Rego + active policies + `data.studio.policy_index` / `studio.keys` / `studio.callers` / `studio.caller_access` / `platform_keys`), flips `/healthz` to ready, starts the JWKS fetcher. Every later mutation just `invalidateBundle`s; the next OPA poll rebuilds.
-7. **`opa`** starts (only now that `backend` is healthy), boots from `opa/config.yaml`, and pulls `GET /bundle/aegis.tar.gz` with `opa_bundle_token`. Until the first bundle activates, `--authorization=basic` is fail-closed (denies all). It re-polls every 10-20s (ETag/304); a fleet of replicas all converge on the same revision.
+   - **warms the OPA bundle** (`opaBundle.buildBundle`: authz Rego + active policies + `data.studio.policy_index` / `studio.keys` / `studio.callers` / `studio.caller_access` / `platform_keys` dynamically scoped by organization), flips `/healthz` to ready, starts the JWKS fetcher. Every later mutation just `invalidateBundle`s the specific organization cache; the next OPA poll rebuilds.
+7. **`opa`** starts (only now that `backend` is healthy), boots from `opa/config.yaml`, and pulls its bundle from `GET /bundle/orgs/:orgId/aegis.tar.gz` (or `/bundle/aegis.tar.gz` fallback) with `opa_bundle_token`. 
+   - **Local Tenant Replication / Compose Deployment**: OPA config supports environment variable substitution (`resource: ${OPA_BUNDLE_PATH:-/bundle/aegis.tar.gz}`). To deploy an isolated physical OPA container for a tenant, operators can run another OPA container (or uncomment the template `opa-tenant-example` in `docker-compose.yml`), mapping `OPA_BUNDLE_PATH=/bundle/orgs/<org-id>/aegis.tar.gz`.
+   - Until the first bundle activates, `--authorization=basic` is fail-closed (denies all). Replicas re-poll every 10-20s (ETag/304) and converge on their configured bundle revision.
 8. **`pep`** starts, reads `pep_token`, creates a Vault-backed signer for `pep-opa-auth-signing`, mints a fresh EdDSA JWT (aud=`opa-studio-pep`) per request to OPA — system_authz restricts the Aegis Sentry aud to read-only paths.
 9. **`frontend`** starts last, serves the SPA on `:3000` and proxies `/api` to backend.
 
@@ -407,6 +436,7 @@ After login, the admin interface presents a state-of-the-art developer workspace
   - *Sandbox* — An interactive playground supporting a side-by-side **Target Rule** and **Mock Aegis Sentry Caller** selector dropdown grid. Selecting an Aegis Sentry caller dynamically injects its structured DB representation under `input.caller` in the payload JSON, synchronizes JWT claims (`sub`, `orgId`) to the Mock JWT Signer, and merges real caller fields during "Auto-fill". Features **Saved Scenarios** CRUD profiles (`localStorage` persisted), an automatic rule execution coverage percentage gauge, and a built-in cryptographic **Mock JWT Signer** utilizing native `SubtleCrypto` to mint valid HS256 tokens client-side and inject them directly into your evaluation input.
   - *History* — Standard version diff comparisons and one-click rollback triggers.
 - **Unified Cryptographic HUD**: Located in the TopBar, this shield-pulse badge opens an overlay detailing engine health, audit chain structural validation, and Aegis TrustVault platform key sync status. Features highly opaque, solid backing (`0.98` opacity) and high-visibility status states (`0.15`–`0.18` background opacities) to prevent overlay text bleeding and keep data extremely legible.
+- **OPA Fleet Status Dashboard**: Accessible via the profile dropdown menu for root/super-admins. Displays real-time KPI metrics for OPA replicas, sync status, polling latency, container IP addresses, organization scopes, and a policy inspector checklist detailing active policies on each container.
 - **Lock / Unlock** — Policies are never hard-deleted. Locking drops the policy from the next bundle so it stops enforcing (eventual — within one OPA poll, ~10-20s, not instant); the row + version history stay. Unlocking re-includes it.
 - **Audit log** — Sequence-ordered immutable record with a chain-verify button. For root: per-actor org column. For sub-admins: rows automatically filtered to their own org.
 - **Manage users** — CRUD, password reset, plus org + role + `is_root` selectors on create. Sub-admins are pinned to their own org; only root can target another org or grant super-admin.
@@ -740,6 +770,92 @@ Failure modes (stable JSON 401, not TLS alerts):
 ### 5. Mix-and-match guarantees
 
 Aegis Sentry dispatches per request, so all three modes run side-by-side. A single deployment can host an `hmac` caller (Conductor), an `mtls` caller (an internal service), and a `jwt` caller (a partner backend) sharing the same `:3002` endpoint. The dispatcher rejects ambiguity — sending both `X-Studio-Sig` and `Authorization: Bearer` in one request returns **401 ambiguous_credentials** rather than guessing precedence. Adding, rotating, or revoking a caller is a hot operation — no Aegis Sentry restart, propagation within ~30s.
+
+---
+
+## Tenant Lifecycle & Dedicated OPA Provisioning Guide
+
+Aegis Policy Fabric supports physical tenant isolation where each organization has its own dedicated, isolated OPA engine replica(s). This guide explains how root admins and operators manage the lifecycle of a tenant and its dedicated OPA containers.
+
+### 1. Tenant Creation (Onboarding)
+1. **Create the Organization**: 
+   - Log in to **Aegis Studio** as a root/super-admin (`admin`).
+   - Navigate to **Organizations** via the topbar menu, click **Create org**, and fill in the Name and URL-friendly Slug.
+   - Alternatively, make an authorized POST call:
+     ```bash
+     curl -X POST http://localhost:3001/api/orgs \
+       -H "Authorization: Bearer <root_jwt_token>" \
+       -H "Content-Type: application/json" \
+       -d '{"name": "Acme Corp", "slug": "acme"}'
+     ```
+2. **Obtain the Tenant UUID**:
+   - Locate the newly created organization in the **Organizations** table and copy its unique `UUID` (e.g., `8f828a2a-e1cf-4f90-a548-73599dc84d5f`).
+
+### 2. Dedicated OPA & PEP Provisioning
+Because Docker Compose is a static local developer environment, creating an organization in the UI does not automatically spin up containers. In production, this is orchestrated dynamically via Kubernetes or cloud APIs.
+
+To deploy the tenant's dedicated OPA and PEP (Aegis Sentry) containers manually:
+
+#### A. OPA Container Setup
+1. **Uncomment and Configure**: Copy the `opa-tenant-example` template in `docker-compose.yml`, assign a unique external port (e.g., `8182:8181`), and set the `OPA_BUNDLE_PATH` environment variable:
+   ```yaml
+   environment:
+     - OPA_BUNDLE_PATH=/bundle/orgs/8f828a2a-e1cf-4f90-a548-73599dc84d5f/aegis.tar.gz
+   ```
+2. **Or run via CLI**:
+   ```bash
+   docker run -d --name opa-tenant-acme --network aegis-suite_opa-net \
+     -v $(pwd)/opa/config.yaml:/config/config.yaml:ro \
+     -v aegis-suite_vault_secrets:/vault/secrets:ro \
+     -e OPA_BUNDLE_PATH=/bundle/orgs/8f828a2a-e1cf-4f90-a548-73599dc84d5f/aegis.tar.gz \
+     openpolicyagent/opa run --server --config-file=/config/config.yaml --authentication=token --authorization=basic
+   ```
+
+#### B. PEP (Aegis Sentry) Container Setup
+1. **Uncomment and Configure**: Copy the `pep-tenant-example` template in `docker-compose.yml`, assign a unique external port (e.g., `3003:3002`), and configure the target `OPA_URL` to route requests to the tenant's OPA container:
+   ```yaml
+   environment:
+     - OPA_URL=http://opa-tenant-acme:8181
+   ```
+2. **Or run via CLI**:
+   ```bash
+   docker run -d --name pep-tenant-acme --network aegis-suite_opa-net \
+     -p 3003:3002 \
+     -e PEP_PORT=3002 \
+     -e OPA_URL=http://opa-tenant-acme:8181 \
+     -e VAULT_ADDR=http://vault:8200 \
+     -e VAULT_TOKEN_FILE=/vault/secrets/pep_token \
+     -v aegis-suite_vault_secrets:/vault/secrets:ro \
+     aegis-suite-pep-image-name-or-build
+   ```
+
+#### C. Verify Connections
+1. **Verify OPA Control Plane Sync**: Open the **OPA Fleet Status** dashboard in Aegis Studio. Verify that a replica container registers under the "Acme Corp" tenant name within 15–20 seconds, displaying its connection status, active policies, and synchronization metrics.
+2. **Test PEP Decision Routing**: Submit a test authorization request to the tenant's PEP port (e.g. `:3003`):
+   ```bash
+   curl -X POST http://localhost:3003/authorize \
+     -H "Content-Type: application/json" \
+     -d '{"policy": "acme/payments", "input": {...}}'
+   ```
+
+### 3. Tenant Lock / Deactivation (Offboarding)
+If a tenant needs to be deactivated or offboarded, operators can handle this in two ways:
+
+#### Option A: Policy-Level Deactivation (Soft Lock)
+- **Action**: The tenant's administrators or root admins lock all active policies owned by that organization in the Aegis Studio Visual Builder.
+- **Impact on OPA**:
+  - The next bundle build for this organization will emit an empty policy index.
+  - The tenant's dedicated OPA container will poll, load the empty bundle, and successfully synchronize.
+  - Because no custom policy modules are loaded, all custom endpoint queries route to standard system defaults, effectively disabling tenant access.
+  - The OPA container remains online and "healthy" (in-sync) in the Fleet Status dashboard, but hosts no rules.
+
+#### Option B: Organization Deletion (Hard Deactivation)
+- **Action**: Delete the organization record from Aegis Studio (allowed only after its dependent users, policies, callers, and trust keys are deleted or reassigned).
+- **Impact on OPA**:
+  - Once the organization is deleted, the backend endpoint `/bundle/orgs/:orgId/aegis.tar.gz` immediately returns a **`404 Not Found`** status code.
+  - **Running Replicas**: The tenant's running OPA containers will keep their last-loaded cached bundle in RAM but will fail all subsequent background poll requests (logging HTTP 404 errors). On the **OPA Fleet Status** dashboard, they will show a sync-drift failure status.
+  - **Restarting/New Replicas**: If an OPA container for the deleted tenant restarts or a new one is launched, it will fail to retrieve a bundle. Because it cannot load the bundle containing the system authorization policies, OPA's `--authorization=basic` rules remain uninitialized, causing the container to **fail-closed (deny-all)** on all gated REST requests.
+  - **Clean Up**: To complete the offboarding process, the infrastructure operator should stop and remove the tenant's OPA container.
 
 ---
 

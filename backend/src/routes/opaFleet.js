@@ -1,6 +1,7 @@
 import { Router } from "express";
 import * as opaTracker from "../services/opaTracker.js";
 import * as opaBundle from "../services/opaBundle.js";
+import * as store from "../services/storage.js";
 import { authorize } from "../middleware/authorize.js";
 
 export function createOpaFleetRouter() {
@@ -34,11 +35,13 @@ export function createOpaFleetRouter() {
     });
 
     const currentPolicies = opaTracker.getPoliciesForRevision(currentRevision) || [];
+    const orgs = await store.listOrgs();
 
     res.json({
       currentRevision,
       replicas: enrichedReplicas,
       currentPolicies,
+      orgs,
     });
   });
 

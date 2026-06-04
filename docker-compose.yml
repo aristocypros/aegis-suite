@@ -51,6 +51,35 @@ services:
     networks:
       - opa-net
 
+  # Template for a dedicated tenant OPA container (Physical Tenant Isolation).
+  # To deploy a physical OPA container for a specific tenant, copy this service definition,
+  # assign a unique port mapping (e.g. 8182:8181), and supply the tenant's organization UUID in the
+  # OPA_BUNDLE_PATH environment parameter.
+  # opa-tenant-example:
+  #   image: openpolicyagent/opa
+  #   ports:
+  #     - "8182:8181"
+  #   volumes:
+  #     - ./opa/config.yaml:/config/config.yaml:ro
+  #     - vault_secrets:/vault/secrets:ro
+  #   environment:
+  #     - OPA_BUNDLE_PATH=/bundle/orgs/REPLACE_WITH_ORG_UUID_HERE/aegis.tar.gz
+  #   command:
+  #     - "run"
+  #     - "--server"
+  #     - "--log-level=info"
+  #     - "--addr=0.0.0.0:8181"
+  #     - "--config-file=/config/config.yaml"
+  #     - "--authentication=token"
+  #     - "--authorization=basic"
+  #   depends_on:
+  #     backend:
+  #       condition: service_healthy
+  #     vault-init:
+  #       condition: service_healthy
+  #   networks:
+  #     - opa-net
+
   postgres:
     image: postgres:16-alpine
     container_name: aegis-postgres
@@ -228,6 +257,35 @@ services:
     networks:
       - opa-net
     restart: unless-stopped
+
+  # Template for a dedicated tenant PEP (Aegis Sentry) container (Physical Tenant Isolation).
+  # To deploy a physical PEP container for a specific tenant, copy this service definition,
+  # assign a unique port mapping (e.g. 3003:3002), and update OPA_URL to target the tenant's dedicated OPA replica.
+  # pep-tenant-example:
+  #   build:
+  #     context: ./pep
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "3003:3002"
+  #   environment:
+  #     - PEP_PORT=3002
+  #     - OPA_URL=http://opa-tenant-example:8181
+  #     - KMS_PROVIDER=${KMS_PROVIDER:-vault}
+  #     - KMS_KEY_ID_PEP_OPA_AUTH=${KMS_KEY_ID_PEP_OPA_AUTH:-pep-opa-auth-signing}
+  #     - VAULT_ADDR=${VAULT_ADDR:-http://vault:8200}
+  #     - VAULT_TOKEN_FILE=/vault/secrets/pep_token
+  #     - NODE_ENV=${PEP_NODE_ENV:-development}
+  #     - PEP_DEV_ALLOW_ANON=${PEP_DEV_ALLOW_ANON:-true}
+  #     - PEP_JWKS_URL=${PEP_JWKS_URL:-http://backend:3001/.well-known/jwks.json}
+  #     - PEP_HMAC_WINDOW_MS=${PEP_HMAC_WINDOW_MS:-30000}
+  #   volumes:
+  #     - vault_secrets:/vault/secrets:ro
+  #   depends_on:
+  #     opa-tenant-example:
+  #       condition: service_healthy
+  #   networks:
+  #     - opa-net
+  #   restart: unless-stopped
 
   frontend:
     build:

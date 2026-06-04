@@ -149,10 +149,57 @@ app.get("/bundle/aegis.tar.gz", async (req, res) => {
   res.set("Cache-Control", "no-store");
   // OPA sends If-None-Match once it holds a revision; 304 skips re-download.
   if ((req.get("if-none-match") || "") === etag) {
-    opaTracker.recordPoll(ip, userAgent, ifNoneMatch, bundle.revision, 304);
+    opaTracker.recordPoll(ip, userAgent, ifNoneMatch, bundle.revision, 304, null);
     return res.status(304).end();
   }
-  opaTracker.recordPoll(ip, userAgent, ifNoneMatch, bundle.revision, 200);
+  opaTracker.recordPoll(ip, userAgent, ifNoneMatch, bundle.revision, 200, null);
+  res.set("Content-Type", "application/gzip");
+  res.status(200).send(bundle.tarGz);
+});
+
+app.get("/bundle/orgs/:orgId/aegis.tar.gz", async (req, res) => {
+  if (!BUNDLE_TOKEN) {
+    return res.status(503).json({ error: "bundle endpoint not configured (no BUNDLE_TOKEN)" });
+  }
+  if (!bundleAuthOk(req)) {
+    res.set("WWW-Authenticate", "Bearer");
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const orgId = req.params.orgId;
+  if (!isUuid(orgId)) {
+    return res.status(400).json({ error: "Invalid organization ID format" });
+  }
+
+  // Best effort check that the organization exists
+  try {
+    const orgExists = await store.getOrgById(orgId);
+    if (!orgExists) {
+      return res.status(404).json({ error: "Organization not found" });
+    }
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to verify organization context" });
+  }
+
+  let bundle;
+  try {
+    bundle = await opaBundle.getBundle(orgId);
+  } catch (e) {
+    console.error(`[opa-bundle] build failed for org ${orgId}: ${e.message}`);
+    return res.status(500).json({ error: "bundle build failed" });
+  }
+
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const userAgent = req.get("user-agent") || "unknown";
+  const ifNoneMatch = req.get("if-none-match") || "";
+
+  const etag = `"${bundle.revision}"`;
+  res.set("ETag", etag);
+  res.set("Cache-Control", "no-store");
+  if ((req.get("if-none-match") || "") === etag) {
+    opaTracker.recordPoll(ip, userAgent, ifNoneMatch, bundle.revision, 304, orgId);
+    return res.status(304).end();
+  }
+  opaTracker.recordPoll(ip, userAgent, ifNoneMatch, bundle.revision, 200, orgId);
   res.set("Content-Type", "application/gzip");
   res.status(200).send(bundle.tarGz);
 });
@@ -676,7 +723,7 @@ app.get("/api/policies/:id/versions/:versionNum", async (req, res) => {
 // mutation just invalidates the cached bundle; the next poll rebuilds and the
 // whole fleet converges. `invalidateBundle` is the single replacement for the
 // old publish* functions and keeps the same fire-and-forget call shape.
-const invalidateBundle = (reason) => opaBundle.invalidateBundle(reason);
+const invalidateBundle = (reason, orgId = null) => opaBundle.invalidateBundle(reason, orgId);
 
 // Bundle-safety probe: a compiled policy that OPA can't parse would, under
 // bundle mode, fail activation of the WHOLE bundle (blast radius: the entire
@@ -790,7 +837,7 @@ app.post("/api/policies", authorize("create", "policy", {
   // list endpoint would (root sees the row regardless; the org-admin
   // creator always sees their own org's row).
   const saved = await store.getPolicy(savedId, req.user);
-  invalidateBundle("policy.create");
+  invalidateBundle("policy.create", saved?.orgId);
   res.json(saved);
 });
 
@@ -843,7 +890,7 @@ app.put("/api/policies/:id", authorize("update", "policy"), async (req, res) => 
     throw e;
   }
   const saved = await store.getPolicy(savedId);
-  invalidateBundle("policy.update");
+  invalidateBundle("policy.update", saved?.orgId);
   res.json(saved);
 });
 
@@ -915,7 +962,7 @@ async function handleSetLocked(req, res, locked) {
   // rebuild drops (lock) or restores (unlock) the policy module AND updates
   // policy_index + caller_access (both filter out locked policies), so the
   // PEP stops/starts admitting calls against it on the next poll.
-  invalidateBundle(locked ? "policy.lock" : "policy.unlock");
+  invalidateBundle(locked ? "policy.lock" : "policy.unlock", result?.orgId);
   res.json(result);
 }
 
@@ -961,7 +1008,7 @@ app.patch("/api/policies/:id/tags", authorize("update", "policy"), async (req, r
     };
   });
 
-  invalidateBundle("policy.tags.update");
+  invalidateBundle("policy.tags.update", before?.orgId);
   res.json({ id: req.params.id, tags: result?.tags ?? nextTags });
 });
 

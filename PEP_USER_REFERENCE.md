@@ -37,6 +37,10 @@ flowchart TD
 
 A **policy denial** is HTTP 200 with `allow: false` — your request was authenticated, the policy ran, and the answer was no. Only auth or transport problems produce 4xx/5xx.
 
+> [!NOTE]
+> **Multi-Tenant Physical Isolation**
+> If your platform operates in a multi-tenant model, policies, OPA engines, and Aegis Sentry PEP instances are physically segregated by organization (tenant). The policies, callers, and trust keys of your organization are compiled into a dedicated organization-scoped bundle (`/bundle/orgs/:orgId/aegis.tar.gz`) pulled dynamically by your dedicated OPA replica(s). Your admin will provide you with the specific Aegis Sentry base URL corresponding to your organization's isolated deployment.
+
 ---
 
 ## 2. Decisions you must make BEFORE contacting the admin

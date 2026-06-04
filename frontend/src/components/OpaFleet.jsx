@@ -17,7 +17,7 @@ function shortHash(hex) {
 }
 
 export default function OpaFleet({ onClose }) {
-  const [data, setData] = useState({ replicas: [], currentRevision: "", currentPolicies: [] });
+  const [data, setData] = useState({ replicas: [], currentRevision: "", currentPolicies: [], orgs: [] });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selectedReplicaIp, setSelectedReplicaIp] = useState(null);
@@ -427,6 +427,7 @@ export default function OpaFleet({ onClose }) {
                     <thead>
                       <tr>
                         <th>Replica IP</th>
+                        <th>Tenant</th>
                         <th>Poll Interval</th>
                         <th>Last Poll</th>
                         <th>Status</th>
@@ -435,6 +436,8 @@ export default function OpaFleet({ onClose }) {
                     <tbody>
                       {filteredReplicas.map((rep) => {
                         const isSelected = selectedReplicaIp === rep.ip;
+                        const org = data.orgs?.find((o) => o.id === rep.orgId);
+                        const orgLabel = org ? org.name : (rep.orgId === null ? "Global" : "Default");
                         return (
                           <tr
                             key={rep.ip}
@@ -442,6 +445,7 @@ export default function OpaFleet({ onClose }) {
                             onClick={() => setSelectedReplicaIp(rep.ip)}
                           >
                             <td className="mono" style={{ fontWeight: 600 }}>{rep.ip}</td>
+                            <td><span className="auth-help text-xs" style={{ fontSize: 12 }}>{orgLabel}</span></td>
                             <td>{rep.pollingInterval ? `${rep.pollingInterval}s` : "—"}</td>
                             <td>{timeAgo(rep.lastPollAt)}</td>
                             <td>
@@ -468,8 +472,25 @@ export default function OpaFleet({ onClose }) {
                     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
                       <div className="detail-card-grid">
                         <div className="detail-meta-item">
+                          <span className="detail-meta-label">Tenant / Org</span>
+                          <span className="detail-meta-val" style={{ fontSize: 12, fontFamily: "var(--font-sans)", color: "var(--text-soft)", fontWeight: 600 }}>
+                            {(() => {
+                              const org = data.orgs?.find((o) => o.id === selectedReplica.orgId);
+                              return org ? `${org.name} (slug: ${org.slug})` : (selectedReplica.orgId === null ? "Global Platform OPA" : `Org UUID: ${selectedReplica.orgId}`);
+                            })()}
+                          </span>
+                        </div>
+                        <div className="detail-meta-item">
+                          <span className="detail-meta-label">Bundle Subscription URL</span>
+                          <span className="detail-meta-val" style={{ fontSize: 12, color: "var(--accent)" }}>
+                            {selectedReplica.orgId
+                              ? `/bundle/orgs/${selectedReplica.orgId}/aegis.tar.gz`
+                              : "/bundle/aegis.tar.gz"}
+                          </span>
+                        </div>
+                        <div className="detail-meta-item">
                           <span className="detail-meta-label">User-Agent</span>
-                          <span className="detail-meta-val" style={{ fontSize: 12, fontFamily: "var(--font-sans)", color: "var(--text-soft)" }}>
+                          <span className="detail-meta-val" style={{ fontSize: 11, fontFamily: "var(--font-sans)", color: "var(--text-soft)" }}>
                             {selectedReplica.userAgent}
                           </span>
                         </div>

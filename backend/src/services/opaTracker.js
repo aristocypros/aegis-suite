@@ -11,7 +11,7 @@ const revisionPoliciesCache = new Map(); // revision -> array of policy metadata
  * Record a poll request from an OPA replica.
  * Computes the replica's poll interval by checking the elapsed time since the previous poll.
  */
-export function recordPoll(ip, userAgent, ifNoneMatch, activeRevision, responseStatus) {
+export function recordPoll(ip, userAgent, ifNoneMatch, activeRevision, responseStatus, orgId = null) {
   const now = Date.now();
   const existing = replicas.get(ip);
   let pollingInterval = null;
@@ -36,6 +36,7 @@ export function recordPoll(ip, userAgent, ifNoneMatch, activeRevision, responseS
     targetRevision: target,
     inSync,
     lastResponseStatus: responseStatus,
+    orgId: orgId || null,
   });
 }
 

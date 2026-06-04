@@ -142,7 +142,7 @@ function minimalRoots(paths) {
 
 // Gather every input the bundle is derived from. Mirrors the old publish*
 // functions exactly so OPA sees identical documents — just delivered via pull.
-async function collect() {
+async function collect(orgId) {
   const [policies, trustRows, callerRows, grants, platform] = await Promise.all([
     store.listPolicies(),
     store.listTrustKeys(),
@@ -151,18 +151,37 @@ async function collect() {
     platformKeys.buildOpaPublishDocument(),
   ]);
 
-  const policyIndex = buildPolicyIndex(policies); // deterministic (no wall-clock)
+  // If orgId is provided, filter the DB results so we only bundle this org's
+  // resources (or global ones where orgId is null).
+  const filteredPolicies = orgId
+    ? policies.filter((p) => p.orgId === orgId || p.orgId === null)
+    : policies;
+  const filteredTrustRows = orgId
+    ? trustRows.filter((r) => r.orgId === orgId || r.orgId === null)
+    : trustRows;
+  const filteredCallerRows = orgId
+    ? callerRows.filter((r) => r.orgId === orgId || r.orgId === null)
+    : callerRows;
+  const filteredGrants = orgId
+    ? grants.filter((g) => {
+        const policy = filteredPolicies.find((p) => p.id === g.policyId);
+        const caller = filteredCallerRows.find((c) => c.callerId === g.callerId);
+        return policy && caller;
+      })
+    : grants;
+
+  const policyIndex = buildPolicyIndex(filteredPolicies); // deterministic (no wall-clock)
 
   // data.studio.keys — flat { kid: pem|secret }, revoked rows dropped.
   const keys = {};
-  for (const row of trustRows) {
+  for (const row of filteredTrustRows) {
     const v = publishValueFromRow(row);
     if (typeof v === "string" && v.length > 0) keys[row.kid] = v;
   }
 
   // data.studio.callers — active rows only (mirrors publishPepCallers).
   const callers = {};
-  for (const r of callerRows) {
+  for (const r of filteredCallerRows) {
     if (r.status !== "active") continue;
     const entry = { auth_mode: r.authMode };
     if (r.authMode === "hmac" && r.hmacSecret) entry.hmac_secret = r.hmacSecret;
@@ -175,13 +194,13 @@ async function collect() {
 
   // data.studio.caller_access — union of explicit grants + tag matches.
   const { access: callerAccess } = buildCallerAccess({
-    grants,
-    policies,
-    callers: callerRows,
+    grants: filteredGrants,
+    policies: filteredPolicies,
+    callers: filteredCallerRows,
   });
 
   // Active (non-locked) compiled policy modules, sorted for a stable revision.
-  const modules = policies
+  const modules = filteredPolicies
     .filter((p) => !p.locked && p.rego && p.package)
     .map((p) => ({ id: p.id, package: p.package, rego: p.rego, name: p.name, version: p.version }))
     .sort((a, b) => String(a.id).localeCompare(String(b.id)));
@@ -190,13 +209,13 @@ async function collect() {
 }
 
 // ─── cache ───────────────────────────────────────────────────────────────────
-let _cache = null;      // { tarGz, revision, builtAt }
-let _building = null;   // in-flight build promise (coalesce concurrent polls)
+const _caches = new Map();     // orgId -> { tarGz, revision, builtAt }
+const _buildings = new Map();  // orgId -> in-flight build promise (coalesce concurrent polls)
 
 // Build the bundle fresh and cache it. Pure read of DB + KMS-derived pubkeys.
-export async function buildBundle() {
+export async function buildBundle(orgId = null) {
   const authz = readAuthzRego();
-  const data = await collect();
+  const data = await collect(orgId);
 
   const roots = minimalRoots([
     ...FIXED_ROOTS,
@@ -237,7 +256,8 @@ export async function buildBundle() {
   ];
 
   const tarGz = gzipSync(buildTar(entries), { level: 9 });
-  _cache = { tarGz, revision, builtAt: Date.now() };
+  const cacheObj = { tarGz, revision, builtAt: Date.now() };
+  _caches.set(orgId, cacheObj);
 
   // Record the policies in this revision
   const revisionPolicies = data.modules.map((m) => ({
@@ -249,32 +269,40 @@ export async function buildBundle() {
   opaTracker.recordRevisionPolicies(revision, revisionPolicies);
 
   console.log(
-    `[opa-bundle] built revision ${revision.slice(0, 12)} ` +
+    `[opa-bundle] built revision ${revision.slice(0, 12)} for org ${orgId || "global"} ` +
       `(${data.modules.length} policies, ${Object.keys(data.callers).length} callers, ` +
       `${Object.keys(data.keys).length} trust keys, ${tarGz.length} bytes gz)`
   );
-  return _cache;
+  return cacheObj;
 }
 
 // Return the cached bundle, building (and coalescing) on a cold cache.
-export async function getBundle() {
-  if (_cache) return _cache;
-  if (!_building) {
-    _building = buildBundle().finally(() => {
-      _building = null;
+export async function getBundle(orgId = null) {
+  const cached = _caches.get(orgId);
+  if (cached) return cached;
+  let promise = _buildings.get(orgId);
+  if (!promise) {
+    promise = buildBundle(orgId).finally(() => {
+      _buildings.delete(orgId);
     });
+    _buildings.set(orgId, promise);
   }
-  return _building;
+  return promise;
 }
 
-export function getCachedBundle() {
-  return _cache;
+export function getCachedBundle(orgId = null) {
+  return _caches.get(orgId);
 }
 
 // Drop the cache so the next poll rebuilds. Lazy on purpose: bursts of
 // mutations batch into a single rebuild on the next OPA poll. Cheap and
 // fire-and-forget-safe — replaces all the old publish* calls.
-export function invalidateBundle(reason) {
-  _cache = null;
-  console.log(`[opa-bundle] invalidated (${reason || "unspecified"})`);
+export function invalidateBundle(reason, orgId = null) {
+  if (orgId) {
+    _caches.delete(orgId);
+    console.log(`[opa-bundle] invalidated org ${orgId} cache (${reason || "unspecified"})`);
+  } else {
+    _caches.clear();
+    console.log(`[opa-bundle] cleared entire bundle cache (${reason || "unspecified"})`);
+  }
 }

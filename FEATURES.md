@@ -7,7 +7,7 @@ This document provides a comprehensive analysis of the features in the **Aegis P
 ## Executive Summary of Code Audit
 
 Based on a thorough review of the current workspace codebase:
-*   **7 Features are CONFIRMED DONE** and successfully integrated:
+*   **9 Features are CONFIRMED DONE** and successfully integrated:
     1.  `KMS-01` — Define `KmsSigner` adapter interface and refactor audit signing (using Vault Transit + stubs).
     2.  `KMS-02` — BYOK import path (`KMS_BYOK_SOURCE` env & `scripts/import-key.js`).
     3.  `CRY-01` — Expanded compiler builtin allowlist (`VERIFICATION_FUNCS` in `regoCompiler.js`).
@@ -15,8 +15,10 @@ Based on a thorough review of the current workspace codebase:
     5.  `CRY-03` — Platform-managed trust store (`policy_trust_keys` table + OPA sync + background fetcher).
     6.  `PEP-01` — Caller authentication on PEP (`pep/src/auth/` modes for `hmac`, `jwt`, `mtls`).
     7.  `PEP-07` — Sandbox Playground (visual scenario profile CRUD, client-side cryptographic `SubtleCrypto` token signer, and rule coverage gauges).
+    8.  `TEN-01` — Organization-scoped tenant bundle pulls (`/bundle/orgs/:orgId/aegis.tar.gz`) for dedicated physical OPA replica isolation.
+    9.  `FLT-01` — OPA Fleet status HUD dashboard and control plane tracking (`/api/opa-fleet` and `OpaFleet.jsx`) for connection counts, sync drift, reported revisions, and loaded policies monitoring.
 *   **33 Features are NOT YET IMPLEMENTED** and make up the backlog below.
-*   **No critical features are missing** from the original backlog, and the "PEP Playground" has been fully implemented in the visual editor SPA.
+*   **No critical features are missing** from the original backlog, and the "PEP Playground" and "OPA Fleet Dashboard" have been fully implemented in the visual editor SPA.
 
 ---
 
@@ -325,3 +327,7 @@ gantt
 ### Manual Staging & Deployment drills
 1.  **Vault Restart Drill**: Terminate the Vault container and restart it. Verify that the auto-unseal mechanism resolves without requiring operators to feed manual Shamir shares.
 2.  **Secret Rotation soaking**: Update the database password or the OPA token in the secret manager. Run a soak test against Aegis Sentry and verify that the DB pools and Aegis Sentry clients swap credentials automatically without dropping active requests.
+3.  **OPA Fleet Status & Tenant Separation Drill**:
+    - Build and run the scaled OPA replica stack using `docker compose up -d --scale opa=3`.
+    - Validate that the OPA Fleet Status dashboard in the UI top-right profile menu automatically discovers and registers all 3 replicas.
+    - Validate that requesting `/bundle/orgs/:orgId/aegis.tar.gz` returns the scoped bundle contents containing only the policies, keys, and callers of that organization, and matches the ETag revision tracked in the fleet dashboard.
