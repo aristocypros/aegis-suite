@@ -27,9 +27,8 @@ bundles:
   aegis:
     service: aegis_backend
     # Supports environment variable substitution for physical tenant segregation.
-    # Defaults to the global bundle (/bundle/aegis.tar.gz). To target a specific tenant,
-    # set the OPA_BUNDLE_PATH environment variable (e.g. /bundle/orgs/<org-uuid>/aegis.tar.gz).
-    resource: ${OPA_BUNDLE_PATH:-/bundle/aegis.tar.gz}
+    # Set the OPA_BUNDLE_PATH environment variable (e.g. /bundle/aegis.tar.gz or /bundle/orgs/<org-uuid>/aegis.tar.gz).
+    resource: ${OPA_BUNDLE_PATH}
     # ~10-20s convergence. ETag/If-None-Match means an unchanged bundle is a
     # cheap 304. Lower these if faster lock/revoke/rotation propagation is
     # needed (at the cost of more polls).

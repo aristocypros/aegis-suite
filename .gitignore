@@ -26,6 +26,7 @@ web_modules/
 *.env
 # But keep .env.example
 !.env.example
+docker-compose.override.yml
 
 # Local development certificates / keys / credentials
 *.pem
@@ -104,3 +105,4 @@ postgres-data/
 vault_data/
 vault_secrets/
 opa_trust/
+scratch/

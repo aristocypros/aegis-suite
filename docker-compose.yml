@@ -10,6 +10,8 @@ services:
       - "8181"
     deploy:
       replicas: 3
+    environment:
+      - OPA_BUNDLE_PATH=/bundle/aegis.tar.gz
     volumes:
       # BUNDLE-PULL mode: OPA boots with ONLY this config and pulls everything
       # (system/studio authz Rego + policies + data + platform_keys) from the
