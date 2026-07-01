@@ -2,6 +2,10 @@
 
 A visual builder that compiles JSON policy specs to Rego, deploys them to OPA, signs every mutation into a tamper-evident audit chain, and serves the resulting decisions through a generic Aegis Sentry (the Policy Enforcement Point). Aegis Policy Fabric targets a single laptop via `docker compose` and the same images deploy unchanged on Kubernetes — cryptographic dependencies (KMS, IdP, trust roots, log sink) swap through BYO adapters, never a code change.
 
+![Aegis Studio walking one policy through the Visual Builder → Diagram → Rego → Sandbox tabs](docs/images/editor/editor-tour.gif)
+
+> **Aegis Studio in motion** — the same policy stepped through the Visual Builder, the Flow Tracer diagram, the compiled Rego, and the live Sandbox. Every screenshot below is captured from the running stack.
+
 ## System Architecture
 
 ```mermaid
@@ -172,6 +176,10 @@ flowchart TD
 | `pep-opa-auth-signing` | pep (every OPA call) | OPA (`system_authz`) | `opa-studio-pep` (reads only) | Aegis Sentry query validation. Compromise allows spoofing read-only OPA requests. |
 
 Rotation goes through `POST /api/platform-keys/rotate`: Vault Transit native versioning (same keyId, bumped version), publish-then-flip ordering so OPA learns the new pubkey before backend signs with it; previous version stays `retired` until `POST /api/platform-keys/:fp/revoke`.
+
+![Platform signing keys — the three Ed25519 purposes, each with fingerprint, lifecycle state, and rotate/revoke actions](docs/images/platform/platform-keys.png)
+
+> The **Platform keys** admin surface: only public material + lifecycle state are stored here — the private keys never leave the KMS provider.
 
 ## Database Architecture & Data Model
 
@@ -399,6 +407,8 @@ The first-boot banner in `backend` logs prints:
 
 Open <http://localhost:3000>, log in, and change the password immediately.
 
+![Aegis Studio sign-in screen](docs/images/editor/login.png)
+
 ### Sanity checks
 
 ```bash
@@ -422,8 +432,14 @@ curl -XPOST http://localhost:3002/discover \
 
 After login, the admin interface presents a state-of-the-art developer workspace with robust navigational and debugging tools:
 
+Every policy starts from the **Template Gallery** — dozens of pre-wired specs across compliance, custody, DeFi, multi-tenancy, and cryptographic-auth categories:
+
+![Template Gallery — categorised, pre-built policy starting points](docs/images/editor/template-gallery.png)
+
 - **High-Scale Sidebar Drill-Down**: A high-capacity tree nested by `Org ➔ Package ➔ Policy` that supports pagination, instant hover duplication/cloning, and a `⌘K` or `Ctrl+K` global search override to instantly bypass the visual hierarchy.
-- **Policy Editor** with five highly-interactive tabs:
+
+  ![Sidebar drill-down — Org → Package → Policy tree with search and filter tabs](docs/images/editor/sidebar-tree.png)
+- **Policy Editor** with six highly-interactive tabs (the sixth, **Callers**, grants Aegis Sentry callers access to this specific policy — the reverse of the *Manage access* pane):
   - *Visual Builder* — A minimalist composer utilizing text-only controls (no icon clutter). Features deep cloning of rules, branches, and logic groups; a left-side outline navigator drawer; and schema-sensing autocomplete popovers sensing keys dynamically from `_sampleInput`.
   - *Diagram (Flow Tracer)* — A visual policy editor flowchart that structurally mirrors the core OPA mental model (`Policy ➔ Rule ➔ Branch ➔ Group ➔ Condition`). Replaces floating disconnected nodes with a singular glassmorphic **Rule Container** card. Features:
     - **Custom Rule Dashboards**: Custom visual layouts tailored to three key OPA Rule Kinds:
@@ -435,13 +451,41 @@ After login, the admin interface presents a state-of-the-art developer workspace
   - *Rego* — Clean compiled output debounced from the Visual Builder. Displays warning lines for deprecated cryptographic functions.
   - *Sandbox* — An interactive playground supporting a side-by-side **Target Rule** and **Mock Aegis Sentry Caller** selector dropdown grid. Selecting an Aegis Sentry caller dynamically injects its structured DB representation under `input.caller` in the payload JSON, synchronizes JWT claims (`sub`, `orgId`) to the Mock JWT Signer, and merges real caller fields during "Auto-fill". Features **Saved Scenarios** CRUD profiles (`localStorage` persisted), an automatic rule execution coverage percentage gauge, and a built-in cryptographic **Mock JWT Signer** utilizing native `SubtleCrypto` to mint valid HS256 tokens client-side and inject them directly into your evaluation input.
   - *History* — Standard version diff comparisons and one-click rollback triggers.
+
+The six editor tabs, exercised on a real policy:
+
+| Visual Builder | Diagram (Flow Tracer) |
+|----------------|-----------------------|
+| [![Visual Builder — rules, branches, and condition groups with the outline navigator](docs/images/editor/visual-builder.png)](docs/images/editor/visual-builder.png) | [![Diagram — glassmorphic Rule Container with the step-debugger and rule-logic inspector](docs/images/editor/diagram-flow-tracer.png)](docs/images/editor/diagram-flow-tracer.png) |
+| **Rego (compiled output)** | **Sandbox (Mock JWT Signer)** |
+| [![Rego — idiomatic Rego v1 compiled live from the Visual Builder](docs/images/editor/rego.png)](docs/images/editor/rego.png) | [![Sandbox — target-rule + mock-caller selectors and the client-side HS256 JWT signer](docs/images/editor/sandbox-jwt.png)](docs/images/editor/sandbox-jwt.png) |
+| **History (diff + rollback)** | **Callers (per-policy grants)** |
+| [![History — per-version Rego diff with one-click restore](docs/images/editor/history.png)](docs/images/editor/history.png) | [![Callers — the reverse view: which Aegis Sentry callers may invoke this policy](docs/images/editor/policy-callers.png)](docs/images/editor/policy-callers.png) |
+
+The **Diagram** tab is a chronological step-debugger — it topologically sorts the rule graph and sweeps a glowing path through it, with a togglable inspector that explains each branch:
+
+![Flow Tracer playback — reset → trace the matched path → inspect the rule logic](docs/images/editor/flow-tracer.gif)
+
 - **Unified Cryptographic HUD**: Located in the TopBar, this shield-pulse badge opens an overlay detailing engine health, audit chain structural validation, and Aegis TrustVault platform key sync status. Features highly opaque, solid backing (`0.98` opacity) and high-visibility status states (`0.15`–`0.18` background opacities) to prevent overlay text bleeding and keep data extremely legible.
+
+  ![Cryptographic Trust & Integrity HUD — engine health, audit-chain proof, and platform-key sync](docs/images/platform/crypto-hud.png)
 - **OPA Fleet Status Dashboard**: Accessible via the profile dropdown menu for root/super-admins. Displays real-time KPI metrics for OPA replicas, sync status, polling latency, container IP addresses, organization scopes, and a policy inspector checklist detailing active policies on each container.
+
+  ![OPA Fleet Status — three replicas in sync, polling the bundle, running the two deployed policies](docs/images/admin/opa-fleet.png)
 - **Lock / Unlock** — Policies are never hard-deleted. Locking drops the policy from the next bundle so it stops enforcing (eventual — within one OPA poll, ~10-20s, not instant); the row + version history stay. Unlocking re-includes it.
 - **Audit log** — Sequence-ordered immutable record with a chain-verify button. For root: per-actor org column. For sub-admins: rows automatically filtered to their own org.
+
+  ![Audit ledger — hash-linked, Ed25519-signed blocks with an end-to-end cryptographic verification pass](docs/images/platform/audit-log.png)
 - **Manage users** — CRUD, password reset, plus org + role + `is_root` selectors on create. Sub-admins are pinned to their own org; only root can target another org or grant super-admin.
+
+  ![Manage users — create form with org/role/is_root selectors and the user table](docs/images/admin/manage-users.png)
 - **Organizations** (root only) — flat tenant list. Hard delete refuses if any users / policies / trust keys / Aegis Sentry callers / custom roles still belong to the org.
+
+  ![Organizations — flat multi-tenant list with create form](docs/images/admin/organizations.png)
+
 - **Roles** (root + org-admin) — manage the action × resource-type permission matrix via a click-grid. Built-in roles are read-only; sub-admins see globals + their own org's locals.
+
+  ![Roles — the action × resource-type permission click-grid plus the built-in role catalogue](docs/images/admin/roles-matrix.png)
 - **Trust keys** — see *Test C* below. For root: org column + org selector on create. Sub-admins create in their own org.
 - **Aegis Sentry callers** — see *Test D* below. Same org column + selector pattern.
 
@@ -470,6 +514,8 @@ After login, the admin interface presents a state-of-the-art developer workspace
 4. Switch to the **Rego** tab to see the emitted `io.jwt.decode_verify(...)` (or `crypto.x509.parse_and_verify_certificates`, or `crypto.hmac.*`) and confirm the truthy guard.
 5. **Save & deploy**. The **Sandbox** tab lets you paste a sample `input` (including a real JWT) and watch the decision evaluate before any client sees it.
 
+![Sandbox — target-rule and mock-caller selectors, editable input JSON, and live/deployed evaluation modes](docs/images/editor/sandbox.png)
+
 The compiler also accepts `verification`-family builtins directly if you need finer control: `io.jwt.verify_{es,rs,ps,hs}{256,384,512}`, `io.jwt.decode`, `crypto.x509.parse_and_verify_certificates`, `crypto.hmac.{sha256,sha384,sha512,equal}`, `crypto.{sha256,sha1,md5}`. MD5 and SHA-1 surface as `warnings` on `POST /api/validate` and are flagged in the emitted Rego with a `# DEPRECATED:` comment — use them only for legacy compatibility.
 
 ### B. Platform trust store
@@ -493,6 +539,8 @@ The compiler also accepts `verification`-family builtins directly if you need fi
    - `jwks_url` — BYO IdP. Per-row TTL, default 30s (`TRUST_KEYS_FETCH_INTERVAL_MS`). Failures preserve last known-good and record `jwks_last_error`.
 5. Save. The active set is carried in the next bundle at `data.studio.keys`, so any policy referencing `data.studio.keys["<kid>"]` starts verifying within one OPA poll — no redeploy.
 6. To rotate or retire a key, hit **Revoke** on the row — it disappears from the next publish, so live policies stop accepting tokens signed by it within one publish interval. **Delete** is only available after revoke; the audit trail of the trust material stays intact.
+
+![Trust keys — add a `kid`/algorithm-scoped key (inline PEM/JWK/secret or JWKS URL); published to OPA at `data.studio.keys`](docs/images/platform/trust-keys.png)
 
 Same actions over the API:
 
@@ -540,7 +588,11 @@ curl -X POST http://localhost:3001/api/trust-keys \
 
 **How to provision callers in the UI.** TopBar → **Aegis Sentry callers** → **Add** → pick **Auth mode**. Per-mode fields appear conditionally; for HMAC, the plaintext secret is shown **once** in a yellow toast — copy it before closing. Subsequent reads return `[REDACTED]`. **Rotate** re-issues the secret (one-shot). **Revoke** is the soft-delete; **Delete** is only available after revoke. `auth_mode` is immutable post-create — to switch modes, revoke and re-add.
 
+![Aegis Sentry callers — per-caller `auth_mode` (hmac/mtls/jwt), one-shot secret, and Manage access / Rotate / Revoke actions](docs/images/platform/sentry-callers.png)
+
 **Per-caller policy access.** Each caller row carries an explicit allowlist of policies it may call. **Manage access** on a caller row opens a checkbox view of every deployed policy (grouped by package prefix) — tick the ones this caller should be able to call, hit Save. The Policy editor's **Callers** tab is the reverse view: pick one policy, see and edit the list of callers granted to invoke it. Both panes operate on the same M:N relation and emit `caller_access.grant` / `caller_access.revoke` audit entries; grants made from either side are immediately visible from the other. New callers start with **zero** access; `/authorize` returns **403 `policy_not_in_scope`** and `/discover` returns an empty list until grants are made. The DB trigger refuses out-of-band writes so even an admin with psql access can't quietly flip a grant. Dev-anon callers (`PEP_DEV_ALLOW_ANON=true`) bypass the ACL.
+
+![Manage access — tick the policies a caller may invoke, or auto-grant via scope tags; changes reach Aegis Sentry within ~30s](docs/images/platform/caller-access.png)
 
 **Tags (live evaluation).** Policies and callers each carry an admin-edited tag list (`tags` on policies, `scope_tags` on callers). The Aegis Sentry ACL publisher unions explicit grants with every policy whose `tags` overlap a caller's `scope_tags` on every publish. A new policy tagged `payments` auto-appears in the allowlist of every caller with `scope_tags: ["payments"]` on the next publish (~30 s, no admin action). Tag changes audit as `policy.tags.update` / `pep_caller.scope_tags.update`. Tag-derived grants can't be revoked individually from the access pane — remove the matching tag from either side to drop them. Locked policies are filtered from the published doc regardless of tags.
 
